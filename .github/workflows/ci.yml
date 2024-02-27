@@ -1,0 +1,45 @@
+---
+name: EctoMiddleware | CI checks
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{github.ref}}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    name: OTP ${{matrix.otp}} / Elixir ${{matrix.elixir}}
+    strategy:
+      matrix:
+        include:
+          - otp: "26.1"
+            elixir: "1.15.7"
+    steps:
+      - name: Checkout Github repo
+        uses: actions/checkout@v3.0.2
+      - name: Setup BEAM Env
+        uses: erlef/setup-beam@v1.15
+        with:
+          otp-version: ${{matrix.otp}}
+          elixir-version: ${{matrix.elixir}}
+      - name: Setup Cache
+        uses: actions/cache@v3.0.4
+        id: mix-cache
+        with:
+          path: |
+            deps
+            _build
+            priv/plts
+          key: ${{ hashFiles('mix.lock') }}-${{ matrix.elixir }}-${{ matrix.otp }}
+      - if: steps.mix-cache.outputs.cache-hit != 'true'
+        run: mkdir -p priv/plts; mix deps.get; mix deps.compile
+      - run: mix lint
+      - run: MIX_ENV=test mix test
