@@ -101,6 +101,32 @@ defmodule EctoMiddleware do
   and the result of running any before middleware, making it an ideal place to perform
   any advanced processing or logging.
 
+  ### Transactionality
+
+  By default, `EctoMiddleware` does not provide any transactional guarantees, and it is
+  up to the implementor to ensure that their middleware is safe within these constraints.
+
+  However, that being said, modules that implement the `EctoMiddleware` behaviour may
+  define a `transactional?/0` callback that returns a boolean value, indicating whether
+  or not the given `Ecto.Repo` callback should be run within a transaction.
+
+  If any transactional middleware are configured, the given `Ecto.Repo` callback will:
+
+    - Partition all middleware into both `before` and `after` middleware.
+    - If any `before` or `after` middleware are transactional, the given `Ecto.Repo`
+      callback will be start a transaction.
+    - Non-transactional middleware will be executed outside this transaction, but
+      transactional middleware will be executed within this transaction.
+
+  Note that if any transactional middleware raise an exception, the transaction will be
+  rolled back, and the exception will be re-raised.
+
+  Additionally, doing so may have performance implications, as by default `EctoMiddleware`
+  hooks into all `Ecto.Repo` callbacks.
+
+  If this is problematic, you may call `EctoMiddleware.set_transactional/2` which will
+  enable transactional middleware for the given module _only_ in the current process.
+
   ## Considerations
 
   When writing middleware, you should be aware of the following:
@@ -125,11 +151,6 @@ defmodule EctoMiddleware do
       multiple `Ecto.Repo` modules, "actions", or "resources". It is not recommended to
       to write middleware that is too strongly coupled to the prior or future middleware
       expected to have/be run.
-
-    - Due to how the given `Ecto.Repo` callback is executed, it is not at this time
-      possible to provide any transactional guarantees for middleware. If you wish to
-      perform any transactional work, you should do so within your application's
-      business logic, and not within any middleware.
 
   ## Testing
 
@@ -180,6 +201,8 @@ defmodule EctoMiddleware do
 
   @type middleware :: [module()]
   @callback middleware(resource :: resource(), resolution :: Resolution.t()) :: resource()
+  @callback transactional?() :: boolean()
+  @optional_callbacks transactional?: 0
 
   @doc "Returns the configured middleware for the given repo."
   @spec middleware(repo :: module(), action(), resource()) :: [middleware()]
@@ -187,12 +210,33 @@ defmodule EctoMiddleware do
     repo.middleware(action, resource)
   end
 
+  @doc "Forces the given Middleware to run in a transaction for the current process."
+  @spec set_transactional(module(), boolean()) :: boolean()
+  def set_transactional(module, bool) when is_atom(module) and is_boolean(bool) do
+    Process.put({__MODULE__, :transactional, module}, bool)
+  end
+
+  @doc "Returns whether or not the given Middleware should run in a transaction."
+  @spec transactional?(module()) :: boolean()
+  def transactional?(module) when is_atom(module) do
+    module_transactional? =
+      if function_exported?(module, :transactional?, 0) do
+        module.transactional?()
+      else
+        false
+      end
+
+    process_overrided? = Process.get({__MODULE__, :transactional, module}, false)
+
+    module_transactional? || process_overrided?
+  end
+
   @doc """
   Returns the configured middleware for the given repo, partitioning by whether or not
   the middleware is intended to run before or after the repo callback.
   """
   @spec partition_middleware(repo :: module(), action(), resource()) ::
-          {[middleware()], [middleware()]}
+          {[middleware()], [middleware()], [middleware()], [middleware()]}
   def partition_middleware(repo, action, resource) do
     {_mode, {before_middleware, after_middleware}} =
       repo
@@ -209,7 +253,14 @@ defmodule EctoMiddleware do
           {:after, {before_middleware, [middleware | after_middleware]}}
       end)
 
-    {before_middleware, after_middleware}
+    {before_transactional_middleware, before_middleware} =
+      Enum.split_with(before_middleware, &transactional?/1)
+
+    {after_transactional_middleware, after_middleware} =
+      Enum.split_with(after_middleware, &transactional?/1)
+
+    {before_middleware, before_transactional_middleware, after_transactional_middleware,
+     after_middleware}
   end
 
   @doc "Enables the ability for a given `Ecto.Repo` to define and execute middleware."
@@ -269,10 +320,33 @@ defmodule EctoMiddleware do
         def unquote(fun)(unquote_splicing(generate_arguments(arity, c))) do
           resolution = Resolution.new!([unquote_splicing(generate_arguments(arity, c))])
           resolution = Resolution.execute_before!(resolution)
-
           input = resolution.before_output
 
-          case super(unquote_splicing([var(:input, c) | tl(generate_arguments(arity, c))])) do
+          {:ok, super_res} =
+            if resolution.start_transaction? do
+              c.transaction(fn ->
+                resolution = Resolution.execute_transactional_before!(resolution)
+                input = resolution.before_output
+
+                case super(unquote_splicing([var(:input, c) | tl(generate_arguments(arity, c))])) do
+                  results when is_list(results) ->
+                    Enum.map(
+                      results,
+                      &Resolution.execute_transactional_after!(resolution, &1).after_output
+                    )
+
+                  %{__meta__: %Ecto.Schema.Metadata{}} = result ->
+                    Resolution.execute_transactional_after!(resolution, result).after_output
+
+                  otherwise ->
+                    otherwise
+                end
+              end)
+            else
+              {:ok, super(unquote_splicing([var(:input, c) | tl(generate_arguments(arity, c))]))}
+            end
+
+          case super_res do
             results when is_list(results) ->
               Enum.map(results, &Resolution.execute_after!(resolution, &1).after_output)
 
@@ -303,8 +377,26 @@ defmodule EctoMiddleware do
         def unquote(fun)(unquote_splicing(generate_arguments(arity, c))) do
           resolution = Resolution.new!([unquote_splicing(generate_arguments(arity, c))])
           resolution = Resolution.execute_before!(resolution)
-
           input = resolution.before_output
+
+          {:ok, super_res} =
+            if resolution.start_transaction? do
+              c.transaction(fn ->
+                resolution = Resolution.execute_transactional_before!(resolution)
+                input = resolution.before_output
+
+                case super(unquote_splicing([var(:input, c) | tl(generate_arguments(arity, c))])) do
+                  {:ok, result} ->
+                    {:ok,
+                     Resolution.execute_transactional_after!(resolution, result).after_output}
+
+                  {:error, reason} ->
+                    Repo.rollback(reason)
+                end
+              end)
+            else
+              {:ok, super(unquote_splicing([var(:input, c) | tl(generate_arguments(arity, c))]))}
+            end
 
           case super(unquote_splicing([var(:input, c) | tl(generate_arguments(arity, c))])) do
             {:ok, result} ->
@@ -334,10 +426,24 @@ defmodule EctoMiddleware do
         def unquote(fun)(unquote_splicing(generate_arguments(arity, c))) do
           resolution = Resolution.new!([unquote_splicing(generate_arguments(arity, c))])
           resolution = Resolution.execute_before!(resolution)
-
           input = resolution.before_output
-          result = super(unquote_splicing([var(:input, c) | tl(generate_arguments(arity, c))]))
 
+          {:ok, super_res} =
+            if resolution.start_transaction? do
+              c.transaction(fn ->
+                resolution = Resolution.execute_transactional_before!(resolution)
+                input = resolution.before_output
+
+                result =
+                  super(unquote_splicing([var(:input, c) | tl(generate_arguments(arity, c))]))
+
+                Resolution.execute_transactional_after!(resolution, result).after_output
+              end)
+            else
+              {:ok, super(unquote_splicing([var(:input, c) | tl(generate_arguments(arity, c))]))}
+            end
+
+          result = super(unquote_splicing([var(:input, c) | tl(generate_arguments(arity, c))]))
           Resolution.execute_after!(resolution, result).after_output
         end
       end
