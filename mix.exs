@@ -44,6 +44,9 @@ defmodule EctoMiddleware.MixProject do
       {:styler, "~> 1.2", only: [:dev, :test], runtime: false},
 
       # Test dependencies
+      {:ecto_sql, "~> 3.11", only: :test},
+      {:ecto_sqlite3, "~> 0.17", only: :test},
+      {:ex_machina, "~> 2.8", only: :test},
       {:mix_test_watch, "~> 1.1", only: :test, runtime: false},
       {:excoveralls, "~> 0.18", only: :test, runtime: false},
 
