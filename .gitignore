@@ -10,3 +10,4 @@ apps/**/cover/
 priv/plts/
 doc/
 .direnv/
+test/test.db*

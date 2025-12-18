@@ -1,5 +1,67 @@
 defmodule EctoMiddleware.Resolution do
-  @moduledoc "Struct for holding middleware resolution data"
+  @moduledoc """
+  Resolution struct that tracks middleware execution context and state.
+
+  The resolution is passed to every middleware callback and contains information about
+  the current operation, remaining middleware, and provides storage for sharing data
+  between middleware.
+
+  ## Core Fields
+
+  - `:repo` - The Repo module executing the operation (e.g., `MyApp.Repo`)
+  - `:action` - The action being performed (e.g., `:insert`, `:update`, `:get`)
+  - `:args` - The full arguments list passed to the Repo function
+  - `:middleware` - The list of remaining middleware to execute
+  - `:entity` - The primary entity/resource being operated on (changeset, struct, query, etc.)
+  - `:private` - Map for passing data between middleware (use `put_private/3` and `get_private/2`)
+
+  ## Using Private Storage
+
+  The `:private` field is a map for storing arbitrary data that middleware need to share:
+
+      defmodule SetContext do
+        use EctoMiddleware
+
+        def process_before(changeset, resolution) do
+          resolution = put_private(resolution, :user_id, 123)
+          resolution = put_private(resolution, :timestamp, DateTime.utc_now())
+          {:cont, changeset, resolution}
+        end
+      end
+
+      defmodule UseContext do
+        use EctoMiddleware
+
+        def process_after(result, resolution) do
+          user_id = get_private(resolution, :user_id)
+          timestamp = get_private(resolution, :timestamp)
+          Logger.info("User \#{user_id} at \#{timestamp}")
+          {:cont, result}
+        end
+      end
+
+  ## Updating Resolution
+
+  To update the resolution and pass it forward, return a 3-tuple:
+
+      def process_before(changeset, resolution) do
+        resolution = put_private(resolution, :key, :value)
+        {:cont, changeset, resolution}
+      end
+
+  ## V1 Compatibility Fields (Deprecated)
+
+  The following fields exist for V1 backwards compatibility and will be removed in v3.0:
+
+  - `:before_input` - Original resource before middleware transformations
+  - `:before_output` - Resource after before middleware, before database operation
+  - `:after_input` - Raw database result before after middleware
+  - `:after_output` - Final result after all middleware
+  - `:before_middleware` - V1 before middleware list
+  - `:after_middleware` - V1 after middleware list
+
+  **Do not use these fields in new code.** Use `:private` storage instead.
+  """
 
   @type t :: %__MODULE__{}
   defstruct [
@@ -8,77 +70,68 @@ defmodule EctoMiddleware.Resolution do
     :args,
     :middleware,
     :entity,
-    :before_middleware,
-    :after_middleware,
+    :private,
     :before_input,
     :before_output,
     :after_input,
-    :after_output
+    :after_output,
+    :before_middleware,
+    :after_middleware
   ]
 
-  defmacro new!(args) do
-    {caller, _arity} = __CALLER__.function
+  @doc """
+  Stores a key-value pair in the resolution's private storage.
 
-    quote bind_quoted: [self: __MODULE__, action: caller, args: args] do
-      entity = List.first(args)
+  This is useful for passing data between middleware in the chain.
 
-      middleware = EctoMiddleware.middleware(__MODULE__, action, entity)
+  ## Example
 
-      {before_middleware, after_middleware} =
-        EctoMiddleware.partition_middleware(__MODULE__, action, entity)
+      resolution = put_private(resolution, :user_id, 123)
+      resolution = put_private(resolution, :context, %{tenant: "acme"})
+  """
+  @spec put_private(t(), key :: atom(), value :: term()) :: t()
+  def put_private(%__MODULE__{private: private} = resolution, key, value) when is_atom(key) do
+    %{resolution | private: Map.put(private || %{}, key, value)}
+  end
 
-      struct!(self,
-        repo: __MODULE__,
-        entity: entity,
-        action: action,
-        args: args,
-        middleware: middleware,
-        before_middleware: before_middleware,
-        after_middleware: after_middleware
-      )
-    end
+  @doc false
+  def set_before_input(%__MODULE__{} = resolution, value) do
+    %{resolution | before_input: value}
+  end
+
+  @doc false
+  def set_before_output(%__MODULE__{} = resolution, value) do
+    %{resolution | before_output: value}
+  end
+
+  @doc false
+  def set_after_input(%__MODULE__{} = resolution, value) do
+    %{resolution | after_input: value}
+  end
+
+  @doc false
+  def set_after_output(%__MODULE__{} = resolution, value) do
+    %{resolution | after_output: value}
   end
 
   @doc """
-  Executes all of the configured "before" middleware for the given resolution.
+  Retrieves a value from the resolution's private storage.
 
-  This function is intended to be used by the `EctoMiddleware` module, but can also be
-  used directly if you need to execute the "before" middleware for testing purposes.
+  Returns the value if found, otherwise returns the provided default (or `nil`).
 
-  Provide a `resolution` struct as the argument with `action`, `args`, and `entity` fields,
-  alongside the `repo` module that the middleware is being executed for.
+  ## Examples
+
+      user_id = get_private(resolution, :user_id)
+      #=> 123
+
+      context = get_private(resolution, :context, %{})
+      #=> %{tenant: "acme"}
+
+      missing = get_private(resolution, :missing)
+      #=> nil
   """
-  @spec execute_before!(t()) :: t()
-  def execute_before!(%__MODULE__{} = resolution) do
-    resolution = %__MODULE__{resolution | before_input: List.first(resolution.args)}
-
-    before_output =
-      resolution
-      |> Map.get(:before_middleware, [])
-      |> Enum.reduce(resolution.before_input, & &1.middleware(&2, resolution))
-
-    %__MODULE__{resolution | before_output: before_output}
-  end
-
-  @doc """
-  Executes all of the configured "after" middleware for the given resolution.
-
-  This function is intended to be used by the `EctoMiddleware` module, but can also be
-  used directly if you need to execute the "after" middleware for testing purposes.
-
-  Provide a `resolution` struct as the argument with `action`, `args`, and `entity` fields,
-  alongside the `repo` module that the middleware is being executed for, alongside the
-  expected return value of the given `Ecto.Repo` callback.
-  """
-  @spec execute_after!(t(), input :: term()) :: t()
-  def execute_after!(%__MODULE__{} = resolution, input) do
-    resolution = %__MODULE__{resolution | after_input: input}
-
-    after_output =
-      resolution
-      |> Map.get(:after_middleware, [])
-      |> Enum.reduce(resolution.after_input, & &1.middleware(&2, resolution))
-
-    %__MODULE__{resolution | after_output: after_output}
+  @spec get_private(t(), key :: atom(), default :: term()) :: term()
+  def get_private(%__MODULE__{private: private}, key, default \\ nil) when is_atom(key) do
+    Map.get(private || %{}, key, default)
   end
 end

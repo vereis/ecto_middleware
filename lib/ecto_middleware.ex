@@ -1,345 +1,306 @@
 defmodule EctoMiddleware do
   @moduledoc """
-  This module provides the `EctoMiddleware` behaviour, which extends any module that
-  uses `Ecto.Repo` with the capability to hook into the execution of any `Ecto.Repo`
-  callback (that reads/writes to said repo).
+  Behaviour for creating middleware that intercepts and transforms Ecto repository operations.
 
-  ## Setup and initialization
+  EctoMiddleware provides a composable way to add cross-cutting concerns to your Ecto
+  operations using a middleware pipeline pattern, similar to Plug or Absinthe middleware.
 
-  To enable `EctoMiddleware`, you must `use` this module in any of your `Ecto.Repo`
-  modules.
+  ## Quick Example
 
-  Once done, you will be able to customize the middleware you wish to run either before,
-  or after any given `Ecto.Repo` callback (again, that reads/writes to said repo).
+      defmodule NormalizeEmail do
+        use EctoMiddleware
 
-  By default, `EctoMiddleware` will not run any middleware. You must explicitly define
-  them yourself.
+        @impl EctoMiddleware
+        def process_before(changeset, _resolution) do
+          case Ecto.Changeset.fetch_change(changeset, :email) do
+            {:ok, email} ->
+              {:cont, Ecto.Changeset.put_change(changeset, :email, String.downcase(email))}
+            :error ->
+              {:cont, changeset}
+          end
+        end
+      end
 
-  You're also able to customize the middleware you wish to run based on the given
-  "action" or "resource" that an `Ecto.Repo` callback is being executed on.
+      defmodule MyApp.Repo do
+        use Ecto.Repo, otp_app: :my_app
+        use EctoMiddleware.Repo
 
-  The "action" of a given `Ecto.Repo` callback is the name of the function being executed,
-  without the arity. For example, the "action" of `get/3` is `get` and the "action" of
-  `get!/3` is `get!`.
+        @impl EctoMiddleware.Repo
+        def middleware(action, resource) when is_insert(action, resource) do
+          [NormalizeEmail, HashPassword, AuditLog]
+        end
 
-  The "resource" of a given `Ecto.Repo` is typically the first argument of the function
-  being executed. For example, the "resource" of `get/3` is a module that uses
-  `Ecto.Schema`.
+        def middleware(_action, _resource), do: [AuditLog]
+      end
 
-  See the below example:
+  ## Core Concepts
 
-  ```elixir
-  defmodule MyApp.Repo do
-    use Ecto.Repo,
-      otp_app: :my_app,
-      adapter: Ecto.Adapters.Postgres
+  ### The API
 
-    use EctoMiddleware
+  Implement `c:process_before/2` to transform data **before** the database operation:
 
-    def middleware(action, _resource) when action in [:delete, :delete!] do
-      [MyApp.EctoMiddleware.MaybeSoftDelete, EctoMiddleware.Super, MyApp.EctoMiddleware.Log]
-    end
+      defmodule AddTimestamp do
+        use EctoMiddleware
 
-    def middleware(_action, _resource) do
-      [EctoMiddleware.Super, MyApp.EctoMiddleware.Log]
-    end
-  end
-  ```
+        @impl EctoMiddleware
+        def process_before(changeset, _resolution) do
+          {:cont, Ecto.Changeset.put_change(changeset, :processed_at, DateTime.utc_now())}
+        end
+      end
 
-  Any middleware preceding `EctoMiddleware.Super` will be executed before the given
-  `Ecto.Repo` callback is executed.
+  Implement `c:process_after/2` to process data **after** the database operation:
 
-  Any middleware following `EctoMiddleware.Super` will be executed after the given
-  `Ecto.Repo` callback is executed.
+      defmodule NotifyAdmin do
+        use EctoMiddleware
 
-  ## Writing Middleware
+        @impl EctoMiddleware
+        def process_after({:ok, user} = result, _resolution) do
+          Task.start(fn -> send_notification(user) end)
+          {:cont, result}
+        end
 
-  To write your own middleware, you must implement the `EctoMiddleware` behaviour in a
-  module of your choosing.
+        def process_after(result, _resolution), do: {:cont, result}
+      end
 
-  The `EctoMiddleware` behaviour requires you to implement the `middleware/2` callback,
-  which takes the "resource" of the given `Ecto.Repo` callback as the first argument,
-  and an `EctoMiddleware.Resolution` struct as the second argument.
+  Implement `c:process/2` to wrap around the entire operation:
 
-  All middleware must return a modified "resource" (or the original "resource" if no
-  modifications were made).
+      defmodule MeasureLatency do
+        use EctoMiddleware
 
-  Additionally, any configured middleware is run synchronously, in the order they are
-  defined.
+        @impl EctoMiddleware
+        def process(resource, resolution) do
+          start_time = System.monotonic_time()
 
-  Please see the `EctoMiddleware.Resolution` struct for more information, but in short,
-  the struct contains various bits of metadata about the given `Ecto.Repo` callback that is
-  being executed, the inputs to the callback, and the result of the callback (if it has
-  been executed).
+          # Yields control to the next middleware (or Repo operation) in the chain
+          # before resuming here.
+          {result, _updated_resolution} = yield(resource, resolution)
 
-  ### Before Middleware
+          duration = System.monotonic_time() - start_time
+          Logger.info("\#{resolution.action} took \#{duration}ns")
 
-  Any middleware preceding `EctoMiddleware.Super` will be executed before the given
-  `Ecto.Repo` callback is executed.
+          result
+        end
+      end
 
-  Because these middlewares run prior to the `Ecto.Repo` callback, they are able to
-  modify the inputs to the callback, or even short-circuit the callback entirely,
-  however, they are not able to modify the result of the callback (as it has not been
-  executed yet).
+  **Important**: When using `c:process/2`, you must call `yield/2` to continue the middleware chain.
 
-  If you wish to modify the result of the callback, you must use an after middleware
-  instead.
+  ### Halting Execution
 
-  ### After Middleware
+  Return `{:halt, value}` to stop the middleware chain and return a value immediately:
 
-  Any middleware following `EctoMiddleware.Super` will be executed after the given
-  `Ecto.Repo` callback is executed.
+      defmodule RequireAuth do
+        use EctoMiddleware
 
-  Because these middlewares run after the `Ecto.Repo` callback, they are able to
-  modify the result of the callback, however, they are not able to modify the inputs
-  to the callback (as it has already been executed).
+        @impl EctoMiddleware
+        def process(resource, resolution) do
+          if authorized?(resolution) do
+            {result, _} = yield(resource, resolution)
+            result
+          else
+            {:halt, {:error, :unauthorized}}
+          end
+        end
 
-  If you wish to modify the inputs to the callback, you must use a before middleware
-  instead.
+        defp authorized?(resolution) do
+          get_private(resolution, :current_user) != nil
+        end
+      end
 
-  After middleware are additionally able to reference both the result of the callback,
-  and the result of running any before middleware, making it an ideal place to perform
-  any advanced processing or logging.
+  ### Guards for Operation Detection
 
-  ## Considerations
+  `EctoMiddleware.Utils` provides guards to detect operations, especially useful for `:insert_or_update`:
 
-  When writing middleware, you should be aware of the following:
+      defmodule ConditionalMiddleware do
+        use EctoMiddleware
 
-    - If you are modifying the "resource" of the given `Ecto.Repo` callback, you should
-      ensure that the "resource" is still valid for the given `Ecto.Repo` callback.
+        @impl EctoMiddleware
+        def process_before(changeset, resolution) when is_insert(changeset, resolution) do
+          {:cont, add_created_metadata(changeset)}
+        end
 
-    - Middleware are run synchronously, in the order they are defined, and as such, you
-      should be mindful of the performance implications of your middleware.
+        def process_before(changeset, resolution) when is_update(changeset, resolution) do
+          {:cont, add_updated_metadata(changeset)}
+        end
 
-    - Any middleware that raises an exception will cause the given `Ecto.Repo` callback
-      to raise an exception as well, regardless of whether or not the given `Ecto.Repo`
-      callback has been executed or semantically is expected to raise an exception.
+        def process_before(changeset, _resolution) do
+          {:cont, changeset}
+        end
+      end
 
-    - Middleware may be a place where dialyzer warnings are suppressed, as it may
-      not be possible for dialyzer to infer the types returned out of any given middleware.
+  ## Return Value Conventions
 
-    - It is not possible to modify the "action" of the given `Ecto.Repo` callback, only the
-      "resource".
+  ### For `c:process_before/2` and `c:process_after/2`
 
-    - Ideally, middleware should be written in such a way that they are reusable across
-      multiple `Ecto.Repo` modules, "actions", or "resources". It is not recommended to
-      to write middleware that is too strongly coupled to the prior or future middleware
-      expected to have/be run.
+  Returning bare values from middleware is supported, but to be explicit, return one of:
 
-    - Due to how the given `Ecto.Repo` callback is executed, it is not at this time
-      possible to provide any transactional guarantees for middleware. If you wish to
-      perform any transactional work, you should do so within your application's
-      business logic, and not within any middleware.
+  - `{:cont, value}` - Continue to next middleware
+  - `{:halt, value}` - Stop execution, return `value`
+  - `{:cont, value, updated_resolution}` - Continue with updated `t:EctoMiddleware.Resolution.t/0`
+  - `{:halt, value, updated_resolution}` - Stop with updated `t:EctoMiddleware.Resolution.t/0`
 
-  ## Testing
+  Bare values are always treated as `{:cont, value}`.
 
-  You may test your middleware modules in a variety of ways:
+  ## Migration from V1
 
-    - You can test your middleware modules in the context of your application's business
-      logic, by stubbing any `Ecto.Repo` callbacks that you wish to test.
+  V1 middleware continue to work but emit deprecation warnings.
 
-    - You can either test your middleware modules in isolation, stubbing any "action" or
-      "resource" that you wish to test.
+  Key differences:
+  - Use `EctoMiddleware.Repo` instead of `EctoMiddleware` in Repo modules
+  - Implement `c:process_before/2`, `c:process_after/2`, or `c:process/2` instead of the deprecated `c:middleware/2`
+  - No need for `EctoMiddleware.Super` marker
+  - Return `{:cont, value}` or `{:halt, value}` instead of bare values
 
-    - You can directly test them by way of executing the given `Ecto.Repo` callback
-      against a test database, and asserting on the result.
+  See the [Migration Guide](https://hexdocs.pm/ecto_middleware/migration_v1_to_v2.html) for details.
 
-    - You can use the `EctoMiddleware.Resolution.execute_before!/1` and
-      `EctoMiddleware.Resolution.execute_after!/2` to directly test middleware.
+  ### Silencing Deprecation Warnings
 
-  In the future, more work will be done to enable easier testing of individual middleware.
+  During migration, you can silence warnings temporarily:
+
+      # In config/config.exs
+      config :ecto_middleware, :silence_deprecation_warnings, true
+
+  This should only be used during migration - deprecated APIs will be removed in v3.0.
   """
 
   alias EctoMiddleware.Resolution
 
-  @type action ::
-          :all
-          | :delete!
-          | :delete
-          | :get!
-          | :get
-          | :get_by!
-          | :get_by
-          | :insert!
-          | :insert
-          | :insert_or_update!
-          | :insert_or_update
-          | :one!
-          | :one
-          | :reload!
-          | :reload
-          | :preload
-          | :update!
-          | :update
+  # NOTE: This will be removed in v3.0
+  @callback middleware(
+              resource :: EctoMiddleware.Repo.resource(),
+              resolution :: Resolution.t()
+            ) :: EctoMiddleware.Repo.resource()
 
-  @type resource ::
-          %{__struct__: Ecto.Queryable}
-          | %{__struct__: Ecto.Changeset}
-          | %{__meta__: Ecto.Schema.Metadata}
-          | {%{__struct__: Ecto.Queryable}, Keyword.t()}
+  @callback process_before(resource :: term(), resolution :: Resolution.t()) :: middleware_result()
+  @callback process_after(result :: term(), resolution :: Resolution.t()) :: middleware_result()
+  @callback process(resource :: term(), resolution :: Resolution.t()) :: middleware_result()
 
-  @type middleware :: [module()]
-  @callback middleware(resource :: resource(), resolution :: Resolution.t()) :: resource()
+  @type middleware_result ::
+          term()
+          | {:cont, term()}
+          | {:halt, term()}
+          | {:ok, term()}
+          | {:error, term()}
 
-  @doc "Returns the configured middleware for the given repo."
-  @spec middleware(repo :: module(), action(), resource()) :: [middleware()]
-  def middleware(repo, action, resource) when is_atom(repo) do
-    repo.middleware(action, resource)
-  end
+  @optional_callbacks middleware: 2, process_before: 2, process_after: 2, process: 2
 
   @doc """
-  Returns the configured middleware for the given repo, partitioning by whether or not
-  the middleware is intended to run before or after the repo callback.
+  Stubs out the necessary behaviours and imports for implementing an `EctoMiddleware`
+  middleware.
+
+  For backwards compatibility, if used in an `Ecto.Repo` module, it will emit a deprecation
+  warning and delegate to `use EctoMiddleware.Repo` instead. This behaviour will be removed in v3.0.
   """
-  @spec partition_middleware(repo :: module(), action(), resource()) ::
-          {[middleware()], [middleware()]}
-  def partition_middleware(repo, action, resource) do
-    {_mode, {before_middleware, after_middleware}} =
-      repo
-      |> middleware(action, resource)
-      |> Enum.reverse()
-      |> Enum.reduce({:after, {[], []}}, fn
-        EctoMiddleware.Super, {:after, {before_middleware, after_middleware}} ->
-          {:before, {before_middleware, after_middleware}}
-
-        middleware, {:before, {before_middleware, after_middleware}} ->
-          {:before, {[middleware | before_middleware], after_middleware}}
-
-        middleware, {:after, {before_middleware, after_middleware}} ->
-          {:after, {before_middleware, [middleware | after_middleware]}}
-      end)
-
-    {before_middleware, after_middleware}
-  end
-
-  @doc "Enables the ability for a given `Ecto.Repo` to define and execute middleware."
   defmacro __using__(_opts) do
     quote location: :keep do
-      @typep middleware :: EctoMiddleware.middleware()
-      @typep action :: EctoMiddleware.action()
-      @typep resource :: EctoMiddleware.resource()
+      if Module.defines?(__MODULE__, {:__adapter__, 0}) do
+        use EctoMiddleware.Repo
 
-      import EctoMiddleware
-      require EctoMiddleware.Resolution, as: Resolution
-      require EctoMiddleware
-      alias __MODULE__, as: Self
+        if !Application.compile_env(:ecto_middleware, :silence_deprecation_warnings, false) do
+          IO.warn("""
+          using `use EctoMiddleware` in a Repo module is deprecated.
+          Please use `use EctoMiddleware.Repo` instead.
+          This will be removed in v3.0.
+          """)
+        end
+      else
+        @behaviour EctoMiddleware
 
-      @spec middleware(action(), resource()) :: [middleware()]
-      def middleware(_action, _resource), do: [EctoMiddleware.Super]
+        import EctoMiddleware.Engine, only: [yield: 2]
 
-      defoverridable middleware: 2,
-                     all: 2,
-                     delete!: 2,
-                     delete: 2,
-                     get!: 3,
-                     get: 3,
-                     get_by!: 3,
-                     get_by: 3,
-                     insert!: 2,
-                     insert: 2,
-                     insert_or_update!: 2,
-                     insert_or_update: 2,
-                     one!: 2,
-                     one: 2,
-                     reload!: 2,
-                     reload: 2,
-                     preload: 3,
-                     update!: 2,
-                     update: 2
+        import EctoMiddleware.Resolution,
+          only: [put_private: 3, get_private: 2, get_private: 3]
 
-      stub_optimistic_functions!()
-      stub_ok_error_functions!()
-      stub_bang_functions!()
-    end
-  end
+        import EctoMiddleware.Utils
 
-  # Automatically execute before and after middleware for the given functions.
-  # These functions return either a list, an ecto schema struct, or arbitary values.
-  # For lists and ecto schemas, ensure the before and after middlewares are executed.
-  @doc false
-  defmacro stub_optimistic_functions! do
-    import Macro
-    c = __MODULE__
+        @spec process_before(term(), Resolution.t()) :: {:cont, term()} | {:halt, term()}
+        def process_before(resource, _resolution), do: {:cont, resource}
 
-    arity_2 = [:one, :all, :reload, :reload!]
-    arity_3 = [:preload, :get_by, :get]
+        @spec process_after(term(), Resolution.t()) :: {:cont, term()} | {:halt, term()}
+        def process_after(result, _resolution), do: {:cont, result}
 
-    for {fun, arity} <- Enum.map(arity_2, &{&1, 2}) ++ Enum.map(arity_3, &{&1, 3}) do
-      quote do
-        def unquote(fun)(unquote_splicing(generate_arguments(arity, c))) do
-          resolution = Resolution.new!([unquote_splicing(generate_arguments(arity, c))])
-          resolution = Resolution.execute_before!(resolution)
+        # Dialyzer warning: These functions are defoverridable, but dialyzer doesn't know that
+        @dialyzer {:nowarn_function, process: 2}
+        def process(resource, resolution) do
+          case normalize(process_before(resource, resolution)) do
+            {:cont, r} ->
+              {result, updated_resolution} = yield(r, resolution)
 
-          input = resolution.before_output
+              case normalize(process_after(result, updated_resolution)) do
+                {:cont, final} -> final
+                {:halt, value} -> value
+              end
 
-          case super(unquote_splicing([var(:input, c) | tl(generate_arguments(arity, c))])) do
-            results when is_list(results) ->
-              Enum.map(results, &Resolution.execute_after!(resolution, &1).after_output)
-
-            %{__meta__: %Ecto.Schema.Metadata{}} = result ->
-              Resolution.execute_after!(resolution, result).after_output
-
-            otherwise ->
-              otherwise
+            {:halt, value} ->
+              value
           end
         end
-      end
-    end
-  end
 
-  # Automatically execute before and after middleware for the given functions.
-  # These functions return either `{:ok, term()}` or `{:error, term()}`.
-  # For `{:ok, term()}`, ensure the before and after middlewares are executed.
-  @doc false
-  defmacro stub_ok_error_functions! do
-    import Macro
-    c = __MODULE__
+        @spec normalize(term() | {:cont, term()} | {:halt, term()} | {:ok, term()} | {:error, term()}) ::
+                {:cont, term()} | {:halt, term()}
+        @dialyzer {:nowarn_function, normalize: 1}
+        defp normalize({:cont, v}), do: {:cont, v}
+        defp normalize({:halt, v}), do: {:halt, v}
 
-    arity_2 = [:insert_or_update, :delete, :update, :insert]
-    arity_3 = []
+        defp normalize({:ok, _} = ok_tuple) do
+          warn_ambiguous(:ok)
+          {:cont, ok_tuple}
+        end
 
-    for {fun, arity} <- Enum.map(arity_2, &{&1, 2}) ++ Enum.map(arity_3, &{&1, 3}) do
-      quote do
-        def unquote(fun)(unquote_splicing(generate_arguments(arity, c))) do
-          resolution = Resolution.new!([unquote_splicing(generate_arguments(arity, c))])
-          resolution = Resolution.execute_before!(resolution)
+        defp normalize({:error, _} = error_tuple) do
+          warn_ambiguous(:error)
+          {:cont, error_tuple}
+        end
 
-          input = resolution.before_output
+        defp normalize(bare) do
+          warn_bare_return()
+          {:cont, bare}
+        end
 
-          case super(unquote_splicing([var(:input, c) | tl(generate_arguments(arity, c))])) do
-            {:ok, result} ->
-              {:ok, Resolution.execute_after!(resolution, result).after_output}
+        @spec warn_ambiguous(atom()) :: :ok
+        @dialyzer {:nowarn_function, warn_ambiguous: 1}
+        defp warn_ambiguous(type) do
+          silenced? = EctoMiddleware.Engine.warnings_silenced?()
 
-            {:error, reason} ->
-              {:error, reason}
+          if !silenced? and !Process.get({:ecto_middleware_ambiguous_warned, __MODULE__, type}) do
+            Process.put({:ecto_middleware_ambiguous_warned, __MODULE__, type}, true)
+
+            IO.warn("""
+            EctoMiddleware: #{inspect(__MODULE__)} returned #{inspect(type)} tuple without explicit :cont or :halt.
+
+            For clarity, wrap your return values:
+              {:cont, #{inspect(type)}}  # to continue with this value
+              {:halt, #{inspect(type)}}  # to stop the middleware chain
+
+            Returning bare #{inspect(type)} tuples is deprecated and will be removed in v3.0.
+            """)
           end
+
+          :ok
         end
-      end
-    end
-  end
 
-  # Automatically execute before and after middleware for the given functions.
-  # These functions either return valid outputs or raise an error.
-  # For valid outputs, ensure the before and after middlewares are executed.
-  @doc false
-  defmacro stub_bang_functions! do
-    import Macro
-    c = __MODULE__
+        @spec warn_bare_return() :: :ok
+        @dialyzer {:nowarn_function, warn_bare_return: 0}
+        defp warn_bare_return do
+          silenced? = EctoMiddleware.Engine.warnings_silenced?()
 
-    arity_2 = [:insert_or_update!, :delete!, :one!, :update!, :insert!]
-    arity_3 = [:get!, :get_by!]
+          if !silenced? and !Process.get({:ecto_middleware_bare_warned, __MODULE__}) do
+            Process.put({:ecto_middleware_bare_warned, __MODULE__}, true)
 
-    for {fun, arity} <- Enum.map(arity_2, &{&1, 2}) ++ Enum.map(arity_3, &{&1, 3}) do
-      quote do
-        def unquote(fun)(unquote_splicing(generate_arguments(arity, c))) do
-          resolution = Resolution.new!([unquote_splicing(generate_arguments(arity, c))])
-          resolution = Resolution.execute_before!(resolution)
+            IO.warn("""
+            EctoMiddleware: #{inspect(__MODULE__)} returned a bare value without wrapping.
 
-          input = resolution.before_output
-          result = super(unquote_splicing([var(:input, c) | tl(generate_arguments(arity, c))]))
+            Please wrap your return values:
+              {:cont, value}  # to continue
+              {:halt, value}  # to stop
 
-          Resolution.execute_after!(resolution, result).after_output
+            Bare returns are deprecated and will be removed in v3.0.
+            """)
+          end
+
+          :ok
         end
+
+        defoverridable process_before: 2, process_after: 2, process: 2
       end
     end
   end
