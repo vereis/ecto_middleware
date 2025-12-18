@@ -215,14 +215,16 @@ defmodule EctoMiddleware do
   @doc "Enables the ability for a given `Ecto.Repo` to define and execute middleware."
   defmacro __using__(_opts) do
     quote location: :keep do
+      import EctoMiddleware
+
+      alias __MODULE__, as: Self
+
+      require EctoMiddleware
+      require EctoMiddleware.Resolution, as: Resolution
+
       @typep middleware :: EctoMiddleware.middleware()
       @typep action :: EctoMiddleware.action()
       @typep resource :: EctoMiddleware.resource()
-
-      import EctoMiddleware
-      require EctoMiddleware.Resolution, as: Resolution
-      require EctoMiddleware
-      alias __MODULE__, as: Self
 
       @spec middleware(action(), resource()) :: [middleware()]
       def middleware(_action, _resource), do: [EctoMiddleware.Super]
@@ -259,6 +261,7 @@ defmodule EctoMiddleware do
   @doc false
   defmacro stub_optimistic_functions! do
     import Macro
+
     c = __MODULE__
 
     arity_2 = [:one, :all, :reload, :reload!]
@@ -293,6 +296,7 @@ defmodule EctoMiddleware do
   @doc false
   defmacro stub_ok_error_functions! do
     import Macro
+
     c = __MODULE__
 
     arity_2 = [:insert_or_update, :delete, :update, :insert]
@@ -324,6 +328,7 @@ defmodule EctoMiddleware do
   @doc false
   defmacro stub_bang_functions! do
     import Macro
+
     c = __MODULE__
 
     arity_2 = [:insert_or_update!, :delete!, :one!, :update!, :insert!]

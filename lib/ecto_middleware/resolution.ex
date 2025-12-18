@@ -50,14 +50,14 @@ defmodule EctoMiddleware.Resolution do
   """
   @spec execute_before!(t()) :: t()
   def execute_before!(%__MODULE__{} = resolution) do
-    resolution = %__MODULE__{resolution | before_input: List.first(resolution.args)}
+    resolution = %{resolution | before_input: List.first(resolution.args)}
 
     before_output =
       resolution
       |> Map.get(:before_middleware, [])
       |> Enum.reduce(resolution.before_input, & &1.middleware(&2, resolution))
 
-    %__MODULE__{resolution | before_output: before_output}
+    %{resolution | before_output: before_output}
   end
 
   @doc """
@@ -72,13 +72,13 @@ defmodule EctoMiddleware.Resolution do
   """
   @spec execute_after!(t(), input :: term()) :: t()
   def execute_after!(%__MODULE__{} = resolution, input) do
-    resolution = %__MODULE__{resolution | after_input: input}
+    resolution = %{resolution | after_input: input}
 
     after_output =
       resolution
       |> Map.get(:after_middleware, [])
       |> Enum.reduce(resolution.after_input, & &1.middleware(&2, resolution))
 
-    %__MODULE__{resolution | after_output: after_output}
+    %{resolution | after_output: after_output}
   end
 end

@@ -3,6 +3,7 @@
     "mix.exs",
     "{config,lib,test,priv}/**/*.{ex,exs}"
   ],
+  plugins: [Styler],
   locals_without_parens: [
     # Formatter tests
     assert_format: 2,
