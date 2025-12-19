@@ -1,14 +1,14 @@
-defmodule EctoMiddlewareTest do
+defmodule EctoMiddleware.V1.ResolutionTest do
   @moduledoc """
-  Unit tests for EctoMiddleware core functionality.
+  V1 API tests for EctoMiddleware core functionality.
 
-  These tests focus on pure functions that don't require an actual Ecto.Repo setup:
+  These tests focus on the deprecated v1 API:
   - partition_middleware/3: Splitting middleware by Super marker
   - Resolution.execute_before!/1: Executing before-middleware chain
   - Resolution.execute_after!/2: Executing after-middleware chain
   - Super.middleware/2: No-op middleware behavior
 
-  Integration tests with actual Ecto operations are in ecto_middleware_integration_test.exs
+  These tests ensure v1 backwards compatibility.
   """
   use ExUnit.Case, async: true
 
@@ -155,20 +155,24 @@ defmodule EctoMiddlewareTest do
   defmodule TestRepo do
     @moduledoc "Test repository with various middleware configurations"
 
+    alias EctoMiddleware.V1.ResolutionTest.TestMiddleware1
+    alias EctoMiddleware.V1.ResolutionTest.TestMiddleware2
+    alias EctoMiddleware.V1.ResolutionTest.TestMiddleware3
+
     def middleware(:all, _resource) do
       [
-        EctoMiddlewareTest.TestMiddleware1,
+        TestMiddleware1,
         EctoMiddleware.Super,
-        EctoMiddlewareTest.TestMiddleware2
+        TestMiddleware2
       ]
     end
 
     def middleware(:insert, _resource) do
       [
-        EctoMiddlewareTest.TestMiddleware1,
-        EctoMiddlewareTest.TestMiddleware2,
+        TestMiddleware1,
+        TestMiddleware2,
         EctoMiddleware.Super,
-        EctoMiddlewareTest.TestMiddleware3
+        TestMiddleware3
       ]
     end
 
@@ -177,7 +181,7 @@ defmodule EctoMiddlewareTest do
     end
 
     def middleware(:update, _resource) do
-      [EctoMiddlewareTest.TestMiddleware1]
+      [TestMiddleware1]
     end
 
     def middleware(:get, _resource) do
@@ -186,42 +190,42 @@ defmodule EctoMiddlewareTest do
 
     def middleware(:multi_super, _resource) do
       [
-        EctoMiddlewareTest.TestMiddleware1,
+        TestMiddleware1,
         EctoMiddleware.Super,
-        EctoMiddlewareTest.TestMiddleware2,
+        TestMiddleware2,
         EctoMiddleware.Super,
-        EctoMiddlewareTest.TestMiddleware3
+        TestMiddleware3
       ]
     end
   end
 
-  describe "EctoMiddleware.partition_middleware/3" do
+  describe "EctoMiddleware.Repo.partition_middleware/3" do
     test "splits middleware at Super marker with before and after" do
       assert {[TestMiddleware1], [TestMiddleware2]} =
-               EctoMiddleware.partition_middleware(TestRepo, :all, %{})
+               EctoMiddleware.Repo.partition_middleware(TestRepo, :all, %{})
     end
 
     test "splits middleware with multiple before and one after" do
       assert {[TestMiddleware1, TestMiddleware2], [TestMiddleware3]} =
-               EctoMiddleware.partition_middleware(TestRepo, :insert, %{})
+               EctoMiddleware.Repo.partition_middleware(TestRepo, :insert, %{})
     end
 
     test "returns empty lists when only Super is present" do
-      assert {[], []} = EctoMiddleware.partition_middleware(TestRepo, :delete, %{})
+      assert {[], []} = EctoMiddleware.Repo.partition_middleware(TestRepo, :delete, %{})
     end
 
     test "treats all middleware as after when Super is absent" do
       assert {[], [TestMiddleware1]} =
-               EctoMiddleware.partition_middleware(TestRepo, :update, %{})
+               EctoMiddleware.Repo.partition_middleware(TestRepo, :update, %{})
     end
 
     test "returns empty lists when no middleware configured" do
-      assert {[], []} = EctoMiddleware.partition_middleware(TestRepo, :get, %{})
+      assert {[], []} = EctoMiddleware.Repo.partition_middleware(TestRepo, :get, %{})
     end
 
     test "handles multiple Super markers (last one determines split)" do
       assert {[TestMiddleware1, EctoMiddleware.Super, TestMiddleware2], [TestMiddleware3]} =
-               EctoMiddleware.partition_middleware(TestRepo, :multi_super, %{})
+               EctoMiddleware.Repo.partition_middleware(TestRepo, :multi_super, %{})
     end
   end
 
@@ -302,7 +306,7 @@ defmodule EctoMiddlewareTest do
       resolution = build_resolution(before_middleware: [ResolutionInspector])
       result = Resolution.execute_before!(resolution)
 
-      assert result.before_output.repo == EctoMiddlewareTest.TestRepo
+      assert result.before_output.repo == EctoMiddleware.V1.ResolutionTest.TestRepo
       assert result.before_output.action == :insert
       assert result.before_output.entity == %{value: 1}
     end
@@ -400,7 +404,7 @@ defmodule EctoMiddlewareTest do
 
   describe "EctoMiddleware.middleware/3" do
     test "returns configured middleware list for action and resource" do
-      assert EctoMiddleware.middleware(TestRepo, :all, %{}) == [
+      assert EctoMiddleware.Repo.middleware(TestRepo, :all, %{}) == [
                TestMiddleware1,
                EctoMiddleware.Super,
                TestMiddleware2
@@ -408,14 +412,14 @@ defmodule EctoMiddlewareTest do
     end
 
     test "returns different middleware based on action" do
-      all_middleware = EctoMiddleware.middleware(TestRepo, :all, %{})
-      insert_middleware = EctoMiddleware.middleware(TestRepo, :insert, %{})
+      all_middleware = EctoMiddleware.Repo.middleware(TestRepo, :all, %{})
+      insert_middleware = EctoMiddleware.Repo.middleware(TestRepo, :insert, %{})
 
       refute all_middleware == insert_middleware
     end
 
     test "returns empty list when no middleware configured" do
-      assert EctoMiddleware.middleware(TestRepo, :get, %{}) == []
+      assert EctoMiddleware.Repo.middleware(TestRepo, :get, %{}) == []
     end
   end
 
@@ -425,20 +429,19 @@ defmodule EctoMiddlewareTest do
         repo: TestRepo,
         action: :insert,
         args: [%{id: 1}],
-        middleware: [TestMiddleware1, EctoMiddleware.Super, TestMiddleware2],
+        middleware: [TestMiddleware1, TestMiddleware2],
         entity: %{id: 1},
-        before_middleware: [TestMiddleware1],
-        after_middleware: [TestMiddleware2],
         before_input: %{id: 1},
         before_output: %{id: 1, test1: true},
         after_input: %{id: 1, test1: true},
-        after_output: %{id: 1, test1: true, test2: true}
+        after_output: %{id: 1, test1: true, test2: true},
+        private: %{some_key: "some_value"}
       }
 
       assert resolution.repo == TestRepo
       assert resolution.action == :insert
       assert length(resolution.args) == 1
-      assert length(resolution.middleware) == 3
+      assert length(resolution.middleware) == 2
     end
 
     test "can be created with minimal fields" do

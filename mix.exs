@@ -5,7 +5,7 @@ defmodule EctoMiddleware.MixProject do
     [
       aliases: aliases(),
       app: :ecto_middleware,
-      version: "1.0.0",
+      version: "2.0.0",
       elixir: "~> 1.13",
       elixirc_options: [warnings_as_errors: true],
       start_permanent: Mix.env() == :prod,
@@ -24,7 +24,8 @@ defmodule EctoMiddleware.MixProject do
       test_coverage: [tool: ExCoveralls],
       package: package(),
       description: description(),
-      source_url: "https://github.com/vereis/ecto_middleware"
+      source_url: "https://github.com/vereis/ecto_middleware",
+      docs: docs()
     ]
   end
 
@@ -87,6 +88,22 @@ defmodule EctoMiddleware.MixProject do
       links: %{
         "GitHub" => "https://github.com/vereis/ecto_middleware"
       }
+    ]
+  end
+
+  defp docs do
+    [
+      main: "EctoMiddleware",
+      extras: [
+        "MIGRATION_V2.md",
+        "V2_QUICK_REFERENCE.md",
+        "V2_IMPLEMENTATION_PLAN.md"
+      ],
+      groups_for_extras: [
+        Guides: ["MIGRATION_V2.md"],
+        Reference: ["V2_QUICK_REFERENCE.md"],
+        Design: ["V2_IMPLEMENTATION_PLAN.md"]
+      ]
     ]
   end
 end

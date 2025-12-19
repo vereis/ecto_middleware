@@ -5,8 +5,10 @@ if Mix.env() == :test do
       otp_app: :ecto_middleware,
       adapter: Ecto.Adapters.SQLite3
 
-    use EctoMiddleware
+    # Use the repo-specific module (v2 way, no deprecation warning)
+    use EctoMiddleware.Repo
 
+    @impl EctoMiddleware.Repo
     def middleware(_action, _resource) do
       Process.get(:test_middleware, [EctoMiddleware.Super])
     end

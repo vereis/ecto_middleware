@@ -1,8 +1,8 @@
 defmodule EctoMiddleware.IntegrationTest do
   @moduledoc """
-  Integration tests for EctoMiddleware with actual Ecto operations.
+  Integration tests for EctoMiddleware v2 API with actual Ecto operations.
 
-  These tests verify that middleware works correctly with real database operations
+  These tests verify that v2 middleware works correctly with real database operations
   including insert, update, delete, and query operations.
   """
   use ExUnit.Case, async: true
@@ -18,362 +18,610 @@ defmodule EctoMiddleware.IntegrationTest do
     :ok
   end
 
-  describe "insert operations with middleware" do
-    test "insert/2 executes middleware in correct order" do
-      defmodule InsertTracker do
-        @moduledoc false
-        @behaviour EctoMiddleware
-
-        def middleware(resource, _resolution) do
-          send(self(), :insert_tracker_ran)
-          resource
-        end
-      end
-
-      Repo.set_middleware([InsertTracker, EctoMiddleware.Super])
-
-      changeset = User.changeset(%User{}, %{name: "Alice", email: "alice@example.com"})
-      {:ok, user} = Repo.insert(changeset)
-
-      assert user.name == "Alice"
-      assert user.email == "alice@example.com"
-      assert user.id
-      assert_received :insert_tracker_ran
-    end
-
-    test "insert/2 with before middleware can transform input" do
+  describe "insert operations with process_before/2" do
+    test "can transform changeset before insert" do
       defmodule EmailNormalizer do
         @moduledoc false
-        @behaviour EctoMiddleware
+        use EctoMiddleware
 
-        def middleware(changeset, _resolution) do
+        @impl true
+        def process_before(changeset, _resolution) do
           Ecto.Changeset.update_change(changeset, :email, &String.downcase/1)
         end
       end
 
-      Repo.set_middleware([EmailNormalizer, EctoMiddleware.Super])
+      Repo.set_middleware([EmailNormalizer])
 
-      changeset = User.changeset(%User{}, %{name: "Bob", email: "BOB@EXAMPLE.COM"})
+      changeset = User.changeset(%User{}, %{name: "Alice", email: "ALICE@EXAMPLE.COM"})
       {:ok, user} = Repo.insert(changeset)
 
-      assert user.email == "bob@example.com"
+      assert user.email == "alice@example.com"
+      assert user.name == "Alice"
     end
 
-    test "insert/2 with after middleware can transform result" do
-      defmodule ResultLogger do
+    test "can add validations before insert" do
+      defmodule StrictValidator do
         @moduledoc false
-        @behaviour EctoMiddleware
+        use EctoMiddleware
 
-        def middleware(user, _resolution) do
-          send(self(), {:inserted, user.id})
-          user
+        @impl true
+        def process_before(changeset, _resolution) do
+          Ecto.Changeset.validate_length(changeset, :name, min: 5)
         end
       end
 
-      Repo.set_middleware([EctoMiddleware.Super, ResultLogger])
+      Repo.set_middleware([StrictValidator])
 
-      changeset = User.changeset(%User{}, %{name: "Charlie", email: "charlie@example.com"})
-      {:ok, _user} = Repo.insert(changeset)
+      changeset = User.changeset(%User{}, %{name: "Bob", email: "bob@example.com"})
+      {:error, changeset} = Repo.insert(changeset)
 
-      assert_received {:inserted, user_id} when is_integer(user_id)
+      assert "should be at least 5 character(s)" in errors_on(changeset).name
     end
 
-    test "insert!/2 executes middleware and raises on error" do
-      defmodule ValidationEnforcer do
+    test "multiple process_before middleware chain transformations" do
+      defmodule TrimName do
         @moduledoc false
-        @behaviour EctoMiddleware
+        use EctoMiddleware
 
-        def middleware(changeset, _resolution) do
-          if Ecto.Changeset.get_field(changeset, :email) == "invalid" do
-            Ecto.Changeset.add_error(changeset, :email, "cannot be 'invalid'")
-          else
-            changeset
+        @impl true
+        def process_before(changeset, _resolution) do
+          Ecto.Changeset.update_change(changeset, :name, &String.trim/1)
+        end
+      end
+
+      defmodule UppercaseName do
+        @moduledoc false
+        use EctoMiddleware
+
+        @impl true
+        def process_before(changeset, _resolution) do
+          Ecto.Changeset.update_change(changeset, :name, &String.upcase/1)
+        end
+      end
+
+      Repo.set_middleware([TrimName, UppercaseName])
+
+      changeset = User.changeset(%User{}, %{name: "  charlie  ", email: "charlie@example.com"})
+      {:ok, user} = Repo.insert(changeset)
+
+      assert user.name == "CHARLIE"
+    end
+  end
+
+  describe "insert operations with process_after/2" do
+    test "can enrich result after insert" do
+      defmodule InsertLogger do
+        @moduledoc false
+        use EctoMiddleware
+
+        @impl true
+        def process_after({:ok, user}, _resolution) do
+          send(self(), {:inserted, user.id})
+          {:ok, Map.put(user, :logged, true)}
+        end
+
+        def process_after(other, _resolution), do: other
+      end
+
+      Repo.set_middleware([InsertLogger])
+
+      changeset = User.changeset(%User{}, %{name: "Dave", email: "dave@example.com"})
+      {:ok, user} = Repo.insert(changeset)
+
+      assert user.logged == true
+      assert_received {:inserted, id} when is_integer(id)
+    end
+
+    test "does not transform errors" do
+      defmodule ErrorPreserver do
+        @moduledoc false
+        use EctoMiddleware
+
+        @impl true
+        def process_after({:ok, user}, _resolution) do
+          {:ok, Map.put(user, :enriched, true)}
+        end
+
+        def process_after({:error, changeset}, _resolution) do
+          {:error, changeset}
+        end
+      end
+
+      Repo.set_middleware([ErrorPreserver])
+
+      changeset = User.changeset(%User{}, %{name: "Eve", email: nil})
+      {:error, changeset} = Repo.insert(changeset)
+
+      refute Map.has_key?(changeset, :enriched)
+      assert "can't be blank" in errors_on(changeset).email
+    end
+  end
+
+  describe "insert operations with process/2 and halting" do
+    test "can halt before database operation (cache hit simulation)" do
+      defmodule CacheChecker do
+        @moduledoc false
+        use EctoMiddleware
+
+        @impl true
+        def process(%Ecto.Changeset{} = changeset, _resolution) do
+          # Simulate cache hit - don't call yield, just return cached result
+          data = Ecto.Changeset.apply_changes(changeset)
+
+          cached_user = %User{
+            id: 999,
+            name: data.name,
+            email: data.email,
+            inserted_at: ~N[2025-01-01 00:00:00],
+            updated_at: ~N[2025-01-01 00:00:00]
+          }
+
+          send(self(), :cache_hit)
+          {:halt, {:ok, cached_user}}
+        end
+
+        # Pass through other resource types (like query modules)
+        def process(resource, resolution) do
+          elem(EctoMiddleware.Engine.yield(resource, resolution), 0)
+        end
+      end
+
+      Repo.set_middleware([CacheChecker])
+
+      changeset = User.changeset(%User{}, %{name: "Frank", email: "frank@example.com"})
+      {:ok, user} = Repo.insert(changeset)
+
+      assert user.id == 999
+      assert user.name == "Frank"
+      assert_received :cache_hit
+
+      # Verify it didn't actually insert (resets middleware to avoid cache hit on get)
+      Repo.reset_middleware()
+      assert Repo.get(User, 999) == nil
+    end
+
+    test "can short-circuit on authorization failure" do
+      defmodule AuthChecker do
+        @moduledoc false
+        use EctoMiddleware
+
+        @impl true
+        def process(%Ecto.Changeset{} = changeset, resolution) do
+          # Simulate unauthorized
+          data = Ecto.Changeset.apply_changes(changeset)
+
+          case data.email do
+            "admin@example.com" ->
+              # Authorized, continue
+              elem(EctoMiddleware.Engine.yield(changeset, resolution), 0)
+
+            _ ->
+              # Unauthorized, halt
+              {:halt, {:error, :unauthorized}}
           end
         end
-      end
 
-      Repo.set_middleware([ValidationEnforcer, EctoMiddleware.Super])
-
-      assert_raise Ecto.InvalidChangesetError, fn ->
-        changeset = User.changeset(%User{}, %{name: "Dave", email: "invalid"})
-        Repo.insert!(changeset)
-      end
-    end
-  end
-
-  describe "update operations with middleware" do
-    test "update/2 executes middleware correctly" do
-      user = Repo.insert!(%User{name: "Eve", email: "eve@example.com"})
-
-      defmodule UpdateTracker do
-        @moduledoc false
-        @behaviour EctoMiddleware
-
-        def middleware(changeset, _resolution) do
-          send(self(), :update_middleware_ran)
-          changeset
+        # Pass through non-changeset resources
+        def process(resource, resolution) do
+          elem(EctoMiddleware.Engine.yield(resource, resolution), 0)
         end
       end
 
-      Repo.set_middleware([UpdateTracker, EctoMiddleware.Super])
+      Repo.set_middleware([AuthChecker])
 
-      changeset = User.changeset(user, %{name: "Eve Updated"})
+      # Authorized
+      changeset = User.changeset(%User{}, %{name: "Admin", email: "admin@example.com"})
+      assert {:ok, %User{}} = Repo.insert(changeset)
+
+      # Unauthorized
+      changeset = User.changeset(%User{}, %{name: "Hacker", email: "hacker@example.com"})
+      assert {:error, :unauthorized} = Repo.insert(changeset)
+    end
+
+    test "full control with yield - logging before and after" do
+      defmodule AuditLogger do
+        @moduledoc false
+        use EctoMiddleware
+
+        @impl true
+        def process(%Ecto.Changeset{} = changeset, resolution) do
+          data = Ecto.Changeset.apply_changes(changeset)
+          send(self(), {:before_insert, data.name})
+
+          result = elem(EctoMiddleware.Engine.yield(changeset, resolution), 0)
+
+          case result do
+            {:ok, user} ->
+              send(self(), {:after_insert, user.id})
+              {:ok, Map.put(user, :audited, true)}
+
+            error ->
+              send(self(), {:insert_failed, data.name})
+              error
+          end
+        end
+
+        # Pass through non-changeset resources
+        def process(resource, resolution) do
+          elem(EctoMiddleware.Engine.yield(resource, resolution), 0)
+        end
+      end
+
+      Repo.set_middleware([AuditLogger])
+
+      changeset = User.changeset(%User{}, %{name: "Ivan", email: "ivan@example.com"})
+      {:ok, user} = Repo.insert(changeset)
+
+      assert user.audited == true
+      assert_received {:before_insert, "Ivan"}
+      assert_received {:after_insert, id} when is_integer(id)
+    end
+  end
+
+  describe "update operations with v2 middleware" do
+    test "process_before can modify changeset before update" do
+      defmodule TimestampUpdater do
+        @moduledoc false
+        use EctoMiddleware
+
+        @impl true
+        def process_before(changeset, _resolution) do
+          Ecto.Changeset.put_change(changeset, :updated_at, ~N[2025-12-25 00:00:00])
+        end
+      end
+
+      user = Repo.insert!(%User{name: "Julia", email: "julia@example.com"})
+
+      Repo.set_middleware([TimestampUpdater])
+
+      changeset = User.changeset(user, %{name: "Julia Updated"})
       {:ok, updated_user} = Repo.update(changeset)
 
-      assert updated_user.name == "Eve Updated"
-      assert_received :update_middleware_ran
+      assert updated_user.name == "Julia Updated"
+      assert updated_user.updated_at == ~N[2025-12-25 00:00:00]
     end
 
-    test "update/2 with before middleware can prevent updates" do
-      user = Repo.insert!(%User{name: "Frank", email: "frank@example.com"})
-
-      defmodule UpdateBlocker do
+    test "can prevent updates with process/2" do
+      defmodule ReadOnlyEnforcer do
         @moduledoc false
-        @behaviour EctoMiddleware
+        use EctoMiddleware
 
-        def middleware(changeset, _resolution) do
-          Ecto.Changeset.add_error(changeset, :base, "updates not allowed")
+        @impl true
+        def process(%Ecto.Changeset{} = changeset, resolution) do
+          # Check if trying to update a read-only user
+          data = Ecto.Changeset.apply_changes(changeset)
+
+          case data.email do
+            "readonly@example.com" ->
+              {:halt, {:error, :read_only}}
+
+            _ ->
+              elem(EctoMiddleware.Engine.yield(changeset, resolution), 0)
+          end
+        end
+
+        # Pass through non-changeset resources
+        def process(resource, resolution) do
+          elem(EctoMiddleware.Engine.yield(resource, resolution), 0)
         end
       end
 
-      Repo.set_middleware([UpdateBlocker, EctoMiddleware.Super])
+      user = Repo.insert!(%User{name: "ReadOnly", email: "readonly@example.com"})
 
-      changeset = User.changeset(user, %{name: "Frank Updated"})
-      {:error, changeset} = Repo.update(changeset)
+      Repo.set_middleware([ReadOnlyEnforcer])
 
-      assert {:base, {"updates not allowed", []}} in changeset.errors
+      changeset = User.changeset(user, %{name: "Modified"})
+      assert {:error, :read_only} = Repo.update(changeset)
+
+      # Verify it wasn't actually updated
+      fresh_user = Repo.get(User, user.id)
+      assert fresh_user.name == "ReadOnly"
     end
   end
 
-  describe "delete operations with middleware" do
-    test "delete/2 executes middleware" do
-      user = Repo.insert!(%User{name: "Grace", email: "grace@example.com"})
-
-      defmodule DeleteLogger do
+  describe "delete operations with v2 middleware" do
+    test "can implement soft delete with process/2" do
+      defmodule SoftDeleter do
         @moduledoc false
-        @behaviour EctoMiddleware
+        use EctoMiddleware
 
-        def middleware(user, _resolution) do
-          send(self(), {:deleting, user.id})
-          user
+        @impl true
+        def process(%User{} = user, _resolution) do
+          send(self(), {:soft_deleted, user.id})
+          {:halt, {:ok, user}}
+        end
+
+        def process(resource, resolution) do
+          elem(EctoMiddleware.Engine.yield(resource, resolution), 0)
         end
       end
 
-      Repo.set_middleware([DeleteLogger, EctoMiddleware.Super])
+      user = Repo.insert!(%User{name: "Kate", email: "kate@example.com"})
+
+      Repo.set_middleware([SoftDeleter])
 
       {:ok, deleted_user} = Repo.delete(user)
 
       assert deleted_user.id == user.id
-      assert_received {:deleting, _}
+      assert_received {:soft_deleted, _}
+
+      # Verify it wasn't actually deleted
+      Repo.reset_middleware()
+      assert Repo.get(User, user.id)
     end
 
-    test "delete!/2 executes middleware and returns struct" do
-      user = Repo.insert!(%User{name: "Heidi", email: "heidi@example.com"})
-
-      defmodule DeleteNotifier do
+    test "process_after can log successful deletions" do
+      defmodule DeleteLogger do
         @moduledoc false
-        @behaviour EctoMiddleware
+        use EctoMiddleware
 
-        def middleware(struct, _resolution) do
-          send(self(), :delete_confirmed)
-          struct
+        @impl true
+        def process_after({:ok, user}, _resolution) do
+          send(self(), {:deleted, user.id, user.name})
+          {:ok, user}
         end
+
+        def process_after(other, _resolution), do: other
       end
 
-      Repo.set_middleware([EctoMiddleware.Super, DeleteNotifier])
+      user = Repo.insert!(%User{name: "Leo", email: "leo@example.com"})
 
-      deleted_user = Repo.delete!(user)
+      Repo.set_middleware([DeleteLogger])
+
+      {:ok, deleted_user} = Repo.delete(user)
 
       assert deleted_user.id == user.id
-      assert_received :delete_confirmed
+      assert_received {:deleted, id, "Leo"} when is_integer(id)
     end
   end
 
-  describe "query operations with middleware" do
-    test "get/3 executes after middleware on result" do
-      user = Repo.insert!(%User{name: "Ivan", email: "ivan@example.com"})
-
+  describe "query operations with v2 middleware" do
+    test "process_after enriches get results" do
       defmodule GetEnricher do
         @moduledoc false
-        @behaviour EctoMiddleware
+        use EctoMiddleware
 
-        def middleware(user, _resolution) when is_struct(user) do
+        @impl true
+        def process_after(user, _resolution) when is_struct(user, User) do
           Map.put(user, :enriched, true)
         end
 
-        def middleware(other, _resolution), do: other
+        def process_after(other, _resolution), do: other
       end
 
-      Repo.set_middleware([EctoMiddleware.Super, GetEnricher])
+      user = Repo.insert!(%User{name: "Mike", email: "mike@example.com"})
+
+      Repo.set_middleware([GetEnricher])
 
       result = Repo.get(User, user.id)
 
       assert result.enriched == true
-      assert result.name == "Ivan"
+      assert result.name == "Mike"
     end
 
-    test "get_by/3 executes middleware on result" do
-      Repo.insert!(%User{name: "Judy", email: "judy@example.com"})
-
-      defmodule GetByLogger do
+    test "process_after enriches all results" do
+      defmodule AllEnricher do
         @moduledoc false
-        @behaviour EctoMiddleware
+        use EctoMiddleware
 
-        def middleware(user, _resolution) when is_struct(user) do
-          send(self(), {:found, user.email})
-          user
+        @impl true
+        def process_after(users, _resolution) when is_list(users) do
+          Enum.map(users, &Map.put(&1, :enriched, true))
         end
 
-        def middleware(other, _resolution), do: other
+        def process_after(other, _resolution), do: other
       end
 
-      Repo.set_middleware([EctoMiddleware.Super, GetByLogger])
+      Repo.insert!(%User{name: "Nancy", email: "nancy@example.com"})
+      Repo.insert!(%User{name: "Oscar", email: "oscar@example.com"})
 
-      result = Repo.get_by(User, email: "judy@example.com")
-
-      assert result.email == "judy@example.com"
-      assert_received {:found, "judy@example.com"}
-    end
-
-    test "all/2 executes middleware on each result" do
-      Repo.insert!(%User{name: "Kate", email: "kate@example.com"})
-      Repo.insert!(%User{name: "Leo", email: "leo@example.com"})
-
-      defmodule AllCounter do
-        @moduledoc false
-        @behaviour EctoMiddleware
-
-        def middleware(user, _resolution) when is_struct(user) do
-          Map.put(user, :counted, true)
-        end
-
-        def middleware(other, _resolution), do: other
-      end
-
-      Repo.set_middleware([EctoMiddleware.Super, AllCounter])
+      Repo.set_middleware([AllEnricher])
 
       results = Repo.all(User)
 
       assert length(results) >= 2
-      assert Enum.all?(results, & &1.counted)
+      assert Enum.all?(results, &Map.get(&1, :enriched))
     end
 
-    test "one/2 executes middleware on single result" do
-      import Ecto.Query
-
-      Repo.insert!(%User{name: "Mike", email: "mike@example.com"})
-
-      defmodule OneMarker do
+    test "can implement query caching with process/2" do
+      defmodule QueryCacher do
         @moduledoc false
-        @behaviour EctoMiddleware
+        use EctoMiddleware
 
-        def middleware(user, _resolution) when is_struct(user) do
-          Map.put(user, :is_one, true)
-        end
+        @impl true
+        def process(queryable, resolution) do
+          # Simulate cache check
+          cache_key = inspect(queryable)
 
-        def middleware(other, _resolution), do: other
-      end
+          case Process.get(cache_key) do
+            nil ->
+              # Cache miss - execute query
+              result = elem(EctoMiddleware.Engine.yield(queryable, resolution), 0)
+              Process.put(cache_key, result)
+              send(self(), :cache_miss)
+              result
 
-      Repo.set_middleware([EctoMiddleware.Super, OneMarker])
-
-      result = Repo.one(from(u in User, where: u.email == "mike@example.com"))
-
-      assert result.is_one == true
-    end
-  end
-
-  describe "middleware with multiple transformations" do
-    test "chains multiple before and after middleware" do
-      defmodule Step1 do
-        @moduledoc false
-        @behaviour EctoMiddleware
-
-        def middleware(changeset, _resolution) do
-          Ecto.Changeset.put_change(changeset, :name, "Step1-" <> Ecto.Changeset.get_field(changeset, :name))
+            cached ->
+              # Cache hit - return cached result
+              send(self(), :cache_hit)
+              cached
+          end
         end
       end
 
-      defmodule Step2 do
-        @moduledoc false
-        @behaviour EctoMiddleware
+      user = Repo.insert!(%User{name: "Pete", email: "pete@example.com"})
 
-        def middleware(changeset, _resolution) do
-          Ecto.Changeset.put_change(changeset, :name, Ecto.Changeset.get_field(changeset, :name) <> "-Step2")
-        end
-      end
+      Repo.set_middleware([QueryCacher])
 
-      defmodule Step3 do
-        @moduledoc false
-        @behaviour EctoMiddleware
+      # First call - cache miss
+      result1 = Repo.get(User, user.id)
+      assert_received :cache_miss
 
-        def middleware(user, _resolution) do
-          Map.put(user, :final_step, true)
-        end
-      end
+      # Second call - cache hit
+      result2 = Repo.get(User, user.id)
+      assert_received :cache_hit
 
-      Repo.set_middleware([Step1, Step2, EctoMiddleware.Super, Step3])
-
-      changeset = User.changeset(%User{}, %{name: "Nancy", email: "nancy@example.com"})
-      {:ok, user} = Repo.insert(changeset)
-
-      assert user.name == "Step1-Nancy-Step2"
-      assert user.final_step == true
+      assert result1.id == result2.id
     end
   end
 
-  describe "error handling in middleware" do
-    test "middleware exceptions are propagated" do
-      defmodule FailingMiddleware do
+  describe "error handling with real database errors" do
+    test "database constraint violations propagate through middleware" do
+      defmodule ConstraintLogger do
         @moduledoc false
-        @behaviour EctoMiddleware
+        use EctoMiddleware
 
-        def middleware(_resource, _resolution) do
-          raise "intentional middleware failure"
+        @impl true
+        def process_after({:error, changeset}, _resolution) do
+          send(self(), :constraint_error)
+          {:error, changeset}
         end
+
+        def process_after(other, _resolution), do: other
       end
 
-      Repo.set_middleware([FailingMiddleware, EctoMiddleware.Super])
+      Repo.insert!(%User{name: "Quinn", email: "quinn@example.com"})
 
-      assert_raise RuntimeError, "intentional middleware failure", fn ->
-        changeset = User.changeset(%User{}, %{name: "Oscar", email: "oscar@example.com"})
-        Repo.insert(changeset)
-      end
-    end
+      Repo.set_middleware([ConstraintLogger])
 
-    test "database errors are not caught by middleware" do
-      Repo.insert!(%User{name: "Pete", email: "pete@example.com"})
-
-      defmodule NoOpMiddleware do
-        @moduledoc false
-        @behaviour EctoMiddleware
-
-        def middleware(resource, _resolution), do: resource
-      end
-
-      Repo.set_middleware([NoOpMiddleware, EctoMiddleware.Super])
-
-      changeset = User.changeset(%User{}, %{name: "Pete2", email: "pete@example.com"})
+      # Try to insert duplicate email
+      changeset = User.changeset(%User{}, %{name: "Quinn2", email: "quinn@example.com"})
 
       assert_raise Ecto.ConstraintError, fn ->
         Repo.insert(changeset)
       end
     end
+
+    test "middleware exceptions propagate correctly" do
+      defmodule FailingMiddleware do
+        @moduledoc false
+        use EctoMiddleware
+
+        @impl true
+        def process_before(_changeset, _resolution) do
+          raise "middleware error"
+        end
+      end
+
+      Repo.set_middleware([FailingMiddleware])
+
+      changeset = User.changeset(%User{}, %{name: "Rachel", email: "rachel@example.com"})
+
+      assert_raise RuntimeError, "middleware error", fn ->
+        Repo.insert(changeset)
+      end
+    end
   end
 
-  describe "middleware with Post schema" do
-    test "insert and query posts with middleware" do
+  describe "complex scenarios" do
+    test "chaining multiple middleware with different purposes" do
+      defmodule Validator do
+        @moduledoc false
+        use EctoMiddleware
+
+        @impl true
+        def process_before(changeset, _resolution) do
+          Ecto.Changeset.validate_format(changeset, :email, ~r/@/)
+        end
+      end
+
+      defmodule Normalizer do
+        @moduledoc false
+        use EctoMiddleware
+
+        @impl true
+        def process_before(changeset, _resolution) do
+          changeset
+          |> Ecto.Changeset.update_change(:name, &String.trim/1)
+          |> Ecto.Changeset.update_change(:email, &String.downcase/1)
+        end
+      end
+
+      defmodule Auditor do
+        @moduledoc false
+        use EctoMiddleware
+
+        @impl true
+        def process_after({:ok, user}, _resolution) do
+          send(self(), {:audit, :insert, user.id})
+          {:ok, user}
+        end
+
+        def process_after(other, _resolution), do: other
+      end
+
+      Repo.set_middleware([Validator, Normalizer, Auditor])
+
+      changeset =
+        User.changeset(%User{}, %{name: "  Sam  ", email: "SAM@EXAMPLE.COM"})
+
+      {:ok, user} = Repo.insert(changeset)
+
+      assert user.name == "Sam"
+      assert user.email == "sam@example.com"
+      assert_received {:audit, :insert, _}
+    end
+
+    test "using Resolution.private to pass data between middleware" do
+      defmodule ContextSetter do
+        @moduledoc false
+        use EctoMiddleware
+
+        @impl true
+        def process(changeset, resolution) do
+          alias EctoMiddleware.Resolution
+
+          resolution = Resolution.put_private(resolution, :user_agent, "TestClient/1.0")
+          resolution = Resolution.put_private(resolution, :ip_address, "127.0.0.1")
+
+          elem(EctoMiddleware.Engine.yield(changeset, resolution), 0)
+        end
+      end
+
+      defmodule ContextLogger do
+        @moduledoc false
+        use EctoMiddleware
+
+        @impl true
+        def process_after({:ok, user}, resolution) do
+          alias EctoMiddleware.Resolution
+
+          user_agent = Resolution.get_private(resolution, :user_agent)
+          ip = Resolution.get_private(resolution, :ip_address)
+
+          send(self(), {:logged_context, user_agent, ip})
+          {:ok, user}
+        end
+
+        def process_after(other, _resolution), do: other
+      end
+
+      Repo.set_middleware([ContextSetter, ContextLogger])
+
+      changeset = User.changeset(%User{}, %{name: "Tina", email: "tina@example.com"})
+      {:ok, _user} = Repo.insert(changeset)
+
+      assert_received {:logged_context, "TestClient/1.0", "127.0.0.1"}
+    end
+
+    test "works with Post schema (different schema)" do
       defmodule PostEnricher do
         @moduledoc false
-        @behaviour EctoMiddleware
+        use EctoMiddleware
 
-        def middleware(post, _resolution) when is_struct(post, Post) do
+        @impl true
+        def process_after({:ok, post}, _resolution) when is_struct(post, Post) do
+          {:ok, Map.put(post, :enriched, true)}
+        end
+
+        def process_after(post, _resolution) when is_struct(post, Post) do
           Map.put(post, :enriched, true)
         end
 
-        def middleware(other, _resolution), do: other
+        def process_after(other, _resolution), do: other
       end
 
-      Repo.set_middleware([EctoMiddleware.Super, PostEnricher])
+      Repo.set_middleware([PostEnricher])
 
       {:ok, post} = Repo.insert(%Post{title: "Test Post", body: "Content"})
 
@@ -383,5 +631,14 @@ defmodule EctoMiddleware.IntegrationTest do
       fetched_post = Repo.get(Post, post.id)
       assert fetched_post.enriched == true
     end
+  end
+
+  # Helper function to extract errors from changeset
+  defp errors_on(changeset) do
+    Ecto.Changeset.traverse_errors(changeset, fn {message, opts} ->
+      Regex.replace(~r"%{(\w+)}", message, fn _, key ->
+        opts |> Keyword.get(String.to_existing_atom(key), key) |> to_string()
+      end)
+    end)
   end
 end

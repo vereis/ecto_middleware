@@ -14,7 +14,7 @@ end
 
 ## About
 
-This library, when `use`-ed, allows you to configure a generic `middleware/2` in any module that has `use Ecto.Repo` within it, like so:
+This library allows you to intercept and customize Ecto repository operations using a middleware pipeline pattern. Each middleware can transform data before the database operation, after it completes, or completely replace the operation.
 
 ```elixir
 defmodule MyApp.Repo do
@@ -22,21 +22,49 @@ defmodule MyApp.Repo do
     otp_app: :my_app,
     adapter: Ecto.Adapters.Postgres
 
+  use EctoMiddleware.Repo
+
+  # Define middleware for specific operations
+  def middleware(:insert, User), do: [EmailNormalizer, AuditLogger]
+  def middleware(:delete, _resource), do: [SoftDelete]
+  def middleware(_action, _resource), do: []
+end
+
+# Transform data before database operations
+defmodule EmailNormalizer do
   use EctoMiddleware
 
-  def middleware(action, _resource) when action in [:delete, :delete!] do
-    [MyApp.EctoMiddleware.MaybeSoftDelete, EctoMiddleware.Super, MyApp.EctoMiddleware.Log]
+  def process_before(changeset, _resolution) do
+    email = Ecto.Changeset.get_field(changeset, :email)
+    {:cont, Ecto.Changeset.put_change(changeset, :email, String.downcase(email))}
   end
+end
 
-  def middleware(_action, _resource) do
-    [EctoMiddleware.Super, MyApp.EctoMiddleware.Log]
+# Add behavior after database operations
+defmodule AuditLogger do
+  use EctoMiddleware
+
+  def process_after({:ok, user}, _resolution) do
+    Logger.info("User created: #{user.id}")
+    {:cont, {:ok, user}}
+  end
+end
+
+# Replace operations entirely
+defmodule SoftDelete do
+  use EctoMiddleware
+
+  def process(record, resolution) do
+    # Instead of deleting, mark as deleted
+    changeset = Ecto.Changeset.change(record, deleted_at: DateTime.utc_now())
+    {:halt, resolution.repo.update(changeset)}
   end
 end
 ```
 
-This is very much inspired by other implementations of the middleware pattern, especially [Absinthe's](https://hexdocs.pm/absinthe/Absinthe.Middleware.html).
+This is inspired by [Absinthe's middleware](https://hexdocs.pm/absinthe/Absinthe.Middleware.html) and provides a clean way to add cross-cutting concerns to your Ecto operations.
 
-By default, `EctoMiddleware` provides the `EctoMiddleware.Super` middleware which is responsible for actually executing any behaviour actually given to you by `Ecto.Repo`. Custom functionality can be added before, or after this `EctoMiddleware.Super` middleware to enable you to customize your repo actions accordingly.
+**Upgrading from v1?** See the [Migration Guide](https://hexdocs.pm/ecto_middleware/migration-v2.html) for details on the new API.
 
 Please see the [docs for more information](https://hexdocs.pm/ecto_middleware)!
 
