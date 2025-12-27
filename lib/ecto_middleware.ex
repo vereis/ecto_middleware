@@ -235,23 +235,24 @@ defmodule EctoMiddleware do
           end
         end
 
+        @doc false
         @spec normalize(term() | {:cont, term()} | {:halt, term()} | {:ok, term()} | {:error, term()}) ::
                 {:cont, term()} | {:halt, term()}
         @dialyzer {:nowarn_function, normalize: 1}
-        defp normalize({:cont, v}), do: {:cont, v}
-        defp normalize({:halt, v}), do: {:halt, v}
+        def normalize({:cont, v}), do: {:cont, v}
+        def normalize({:halt, v}), do: {:halt, v}
 
-        defp normalize({:ok, _} = ok_tuple) do
+        def normalize({:ok, _} = ok_tuple) do
           warn_ambiguous(:ok)
           {:cont, ok_tuple}
         end
 
-        defp normalize({:error, _} = error_tuple) do
+        def normalize({:error, _} = error_tuple) do
           warn_ambiguous(:error)
           {:cont, error_tuple}
         end
 
-        defp normalize(bare) do
+        def normalize(bare) do
           warn_bare_return()
           {:cont, bare}
         end
