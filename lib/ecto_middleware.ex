@@ -170,7 +170,8 @@ defmodule EctoMiddleware do
               resolution :: Resolution.t()
             ) :: EctoMiddleware.Repo.resource()
 
-  @callback process_before(resource :: term(), resolution :: Resolution.t()) :: middleware_result()
+  @callback process_before(resource :: term(), resolution :: Resolution.t()) ::
+              middleware_result()
   @callback process_after(result :: term(), resolution :: Resolution.t()) :: middleware_result()
   @callback process(resource :: term(), resolution :: Resolution.t()) :: middleware_result()
 
@@ -178,6 +179,8 @@ defmodule EctoMiddleware do
           term()
           | {:cont, term()}
           | {:halt, term()}
+          | {:cont, term(), Resolution.t()}
+          | {:halt, term(), Resolution.t()}
           | {:ok, term()}
           | {:error, term()}
 
@@ -190,7 +193,9 @@ defmodule EctoMiddleware do
   For backwards compatibility, if used in an `Ecto.Repo` module, it will emit a deprecation
   warning and delegate to `use EctoMiddleware.Repo` instead. This behaviour will be removed in v3.0.
   """
-  defmacro __using__(_opts) do
+  defmacro __using__(opts) do
+    handles_bulk = Keyword.get(opts, :bulk_operations, false)
+
     quote location: :keep do
       if Module.defines?(__MODULE__, {:__adapter__, 0}) do
         use EctoMiddleware.Repo
@@ -212,6 +217,14 @@ defmodule EctoMiddleware do
 
         import EctoMiddleware.Utils
 
+        # Whether this middleware opted into running on bulk operations
+        # (`insert_all/3`, `update_all/3`, `delete_all/2`). Defaults to `false` so existing
+        # middleware are never silently handed a schema/source or queryable they don't expect when a Repo's
+        # `middleware/2` (e.g. a catch-all clause) returns them for a bulk action.
+        @doc false
+        @spec __ecto_middleware_handles_bulk__() :: boolean()
+        def __ecto_middleware_handles_bulk__, do: unquote(handles_bulk)
+
         @spec process_before(term(), Resolution.t()) :: {:cont, term()} | {:halt, term()}
         def process_before(resource, _resolution), do: {:cont, resource}
 
@@ -220,25 +233,42 @@ defmodule EctoMiddleware do
 
         # Dialyzer warning: These functions are defoverridable, but dialyzer doesn't know that
         @dialyzer {:nowarn_function, process: 2}
+        # NOTE: The cont/halt orchestration lives in `EctoMiddleware.Engine.run_phases/5`
+        #       (compiled once, with the phase callbacks as opaque function values) rather
+        #       than being inlined here. If it were inlined, the compiler's type checker would
+        #       narrow the overridden `process_before/2`/`process_after/2` return types to
+        #       `{:cont, _}` for middleware that never halt and flag the `{:halt, _}` branches
+        #       as dead clauses (or the tag check as a comparison between distinct types).
         def process(resource, resolution) do
-          case normalize(process_before(resource, resolution)) do
-            {:cont, r} ->
-              {result, updated_resolution} = yield(r, resolution)
-
-              case normalize(process_after(result, updated_resolution)) do
-                {:cont, final} -> final
-                {:halt, value} -> value
-              end
-
-            {:halt, value} ->
-              value
-          end
+          EctoMiddleware.Engine.run_phases(
+            resource,
+            resolution,
+            &process_before/2,
+            &process_after/2,
+            &normalize/1
+          )
         end
 
         @doc false
-        @spec normalize(term() | {:cont, term()} | {:halt, term()} | {:ok, term()} | {:error, term()}) ::
-                {:cont, term()} | {:halt, term()}
+        @spec normalize(
+                term()
+                | {:cont, term()}
+                | {:halt, term()}
+                | {:cont, term(), Resolution.t()}
+                | {:halt, term(), Resolution.t()}
+                | {:ok, term()}
+                | {:error, term()}
+              ) ::
+                {:cont, term()}
+                | {:halt, term()}
+                | {:cont, term(), Resolution.t()}
+                | {:halt, term(), Resolution.t()}
         @dialyzer {:nowarn_function, normalize: 1}
+        # Pass 3-tuples through untouched so a phase callback can hand back an updated
+        # resolution. Without these clauses they fall to the bare-value clause below, which
+        # would wrap the whole tuple as the value and warn about a bare return.
+        def normalize({:cont, v, %Resolution{} = r}), do: {:cont, v, r}
+        def normalize({:halt, v, %Resolution{} = r}), do: {:halt, v, r}
         def normalize({:cont, v}), do: {:cont, v}
         def normalize({:halt, v}), do: {:halt, v}
 

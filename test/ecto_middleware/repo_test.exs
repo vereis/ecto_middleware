@@ -7,8 +7,8 @@ defmodule EctoMiddleware.RepoTest do
   import Ecto.Query
 
   alias Ecto.Adapters.SQL.Sandbox
+  alias EctoMiddleware.Resolution
   alias EctoMiddleware.Test.Repo
-  alias EctoMiddleware.Test.Schemas.Post
   alias EctoMiddleware.Test.Schemas.User
 
   setup do
@@ -22,6 +22,59 @@ defmodule EctoMiddleware.RepoTest do
       _ -> flush_messages()
     after
       0 -> :ok
+    end
+  end
+
+  # Shared recorders defined once at module scope (rather than inside each `setup`,
+  # which redefines the module per test and is brittle under async execution).
+
+  defmodule Recorder do
+    @moduledoc false
+    use EctoMiddleware
+
+    def process(resource, resolution) do
+      send(self(), {:before, resolution.action, resource})
+      {result, _} = EctoMiddleware.Engine.yield(resource, resolution)
+      send(self(), {:after, resolution.action, result})
+      result
+    end
+  end
+
+  defmodule ResolutionRecorder do
+    @moduledoc false
+    use EctoMiddleware
+
+    def process(resource, resolution) do
+      send(self(), {:before, resolution.action, resource, resolution})
+      {result, updated_resolution} = EctoMiddleware.Engine.yield(resource, resolution)
+      send(self(), {:after, resolution.action, result, updated_resolution})
+      result
+    end
+  end
+
+  # Bulk-aware variants: opted into bulk operations via `bulk_operations: true`.
+
+  defmodule BulkRecorder do
+    @moduledoc false
+    use EctoMiddleware, bulk_operations: true
+
+    def process(resource, resolution) do
+      send(self(), {:before, resolution.action, resource})
+      {result, _} = EctoMiddleware.Engine.yield(resource, resolution)
+      send(self(), {:after, resolution.action, result})
+      result
+    end
+  end
+
+  defmodule BulkResolutionRecorder do
+    @moduledoc false
+    use EctoMiddleware, bulk_operations: true
+
+    def process(resource, resolution) do
+      send(self(), {:before, resolution.action, resource, resolution})
+      {result, updated_resolution} = EctoMiddleware.Engine.yield(resource, resolution)
+      send(self(), {:after, resolution.action, result, updated_resolution})
+      result
     end
   end
 
@@ -159,19 +212,7 @@ defmodule EctoMiddleware.RepoTest do
 
   describe "insert/2 operations" do
     setup do
-      defmodule InsertRecorder do
-        @moduledoc false
-        use EctoMiddleware
-
-        def process(resource, resolution) do
-          send(self(), {:before, resolution.action, resource})
-          {result, _} = EctoMiddleware.Engine.yield(resource, resolution)
-          send(self(), {:after, resolution.action, result})
-          result
-        end
-      end
-
-      Repo.set_middleware([InsertRecorder])
+      Repo.set_middleware([Recorder])
       :ok
     end
 
@@ -215,19 +256,7 @@ defmodule EctoMiddleware.RepoTest do
 
   describe "update/2 operations" do
     setup do
-      defmodule UpdateRecorder do
-        @moduledoc false
-        use EctoMiddleware
-
-        def process(resource, resolution) do
-          send(self(), {:before, resolution.action, resource})
-          {result, _} = EctoMiddleware.Engine.yield(resource, resolution)
-          send(self(), {:after, resolution.action, result})
-          result
-        end
-      end
-
-      Repo.set_middleware([UpdateRecorder])
+      Repo.set_middleware([Recorder])
       :ok
     end
 
@@ -269,19 +298,7 @@ defmodule EctoMiddleware.RepoTest do
 
   describe "delete/2 operations" do
     setup do
-      defmodule DeleteRecorder do
-        @moduledoc false
-        use EctoMiddleware
-
-        def process(resource, resolution) do
-          send(self(), {:before, resolution.action, resource})
-          {result, _} = EctoMiddleware.Engine.yield(resource, resolution)
-          send(self(), {:after, resolution.action, result})
-          result
-        end
-      end
-
-      Repo.set_middleware([DeleteRecorder])
+      Repo.set_middleware([Recorder])
       :ok
     end
 
@@ -310,19 +327,7 @@ defmodule EctoMiddleware.RepoTest do
 
   describe "query operations - get" do
     setup do
-      defmodule GetRecorder do
-        @moduledoc false
-        use EctoMiddleware
-
-        def process(resource, resolution) do
-          send(self(), {:before, resolution.action, resource})
-          {result, _} = EctoMiddleware.Engine.yield(resource, resolution)
-          send(self(), {:after, resolution.action, result})
-          result
-        end
-      end
-
-      Repo.set_middleware([GetRecorder])
+      Repo.set_middleware([Recorder])
       :ok
     end
 
@@ -372,19 +377,7 @@ defmodule EctoMiddleware.RepoTest do
 
   describe "query operations - all/one" do
     setup do
-      defmodule QueryRecorder do
-        @moduledoc false
-        use EctoMiddleware
-
-        def process(resource, resolution) do
-          send(self(), {:before, resolution.action, resource})
-          {result, _} = EctoMiddleware.Engine.yield(resource, resolution)
-          send(self(), {:after, resolution.action, result})
-          result
-        end
-      end
-
-      Repo.set_middleware([QueryRecorder])
+      Repo.set_middleware([Recorder])
       :ok
     end
 
@@ -410,6 +403,166 @@ defmodule EctoMiddleware.RepoTest do
       assert_received {:before, :all, User}
       assert_received {:after, :all, list} when is_list(list)
       assert length(results) >= 2
+    end
+  end
+
+  describe "batch operations" do
+    setup do
+      Repo.set_middleware([BulkRecorder])
+      :ok
+    end
+
+    test "insert_all/3 executes middleware and returns {count, _}" do
+      now = NaiveDateTime.truncate(NaiveDateTime.utc_now(), :second)
+
+      rows = [
+        %{name: "Bulk One", email: "bulk_insert_1@example.com", age: 20, inserted_at: now, updated_at: now},
+        %{name: "Bulk Two", email: "bulk_insert_2@example.com", age: 21, inserted_at: now, updated_at: now}
+      ]
+
+      {count, _} = Repo.insert_all(User, rows)
+
+      assert count == 2
+      assert_received {:before, :insert_all, User}
+      assert_received {:after, :insert_all, {2, _}}
+    end
+
+    test "update_all/3 executes middleware and returns {count, _}" do
+      {:ok, _} = Repo.insert(%User{name: "Bulk Update A", email: "bulk_update_1@example.com", age: 10})
+      {:ok, _} = Repo.insert(%User{name: "Bulk Update B", email: "bulk_update_2@example.com", age: 11})
+      flush_messages()
+
+      query = from(u in User, where: like(u.email, "bulk_update_%@example.com"))
+      {count, _} = Repo.update_all(query, set: [age: 42])
+
+      assert count == 2
+      assert_received {:before, :update_all, %Ecto.Query{}}
+      assert_received {:after, :update_all, {2, _}}
+    end
+
+    test "delete_all/2 executes middleware and returns {count, _}" do
+      {:ok, _} = Repo.insert(%User{name: "Bulk Delete A", email: "bulk_delete_1@example.com"})
+      {:ok, _} = Repo.insert(%User{name: "Bulk Delete B", email: "bulk_delete_2@example.com"})
+      flush_messages()
+
+      query = from(u in User, where: like(u.email, "bulk_delete_%@example.com"))
+      {count, _} = Repo.delete_all(query)
+
+      assert count == 2
+      assert_received {:before, :delete_all, %Ecto.Query{}}
+      assert_received {:after, :delete_all, {2, _}}
+    end
+  end
+
+  describe "batch operations with :returning" do
+    setup do
+      Repo.set_middleware([BulkResolutionRecorder])
+      :ok
+    end
+
+    test "insert_all/3 with :returning surfaces inserted rows (with ids) to middleware" do
+      now = NaiveDateTime.truncate(NaiveDateTime.utc_now(), :second)
+
+      rows = [
+        %{name: "Ret One", email: "ret_insert_1@example.com", age: 30, inserted_at: now, updated_at: now},
+        %{name: "Ret Two", email: "ret_insert_2@example.com", age: 31, inserted_at: now, updated_at: now}
+      ]
+
+      {count, [%{id: id1}, %{id: id2}]} = Repo.insert_all(User, rows, returning: [:id])
+
+      assert count == 2
+      assert is_integer(id1) and is_integer(id2)
+
+      # Without :returning the second element is nil; here the middleware sees the
+      # returned rows passed straight through from Ecto.
+      assert_received {:after, :insert_all, {2, [%{id: _}, %{id: _}]}, %Resolution{}}
+    end
+
+    test "resolution captured after yield exposes the operation context and result" do
+      now = NaiveDateTime.truncate(NaiveDateTime.utc_now(), :second)
+
+      rows = [
+        %{name: "Res One", email: "res_insert_1@example.com", age: 40, inserted_at: now, updated_at: now}
+      ]
+
+      {1, _} = Repo.insert_all(User, rows)
+
+      assert_received {:after, :insert_all, {1, _},
+                       %Resolution{
+                         action: :insert_all,
+                         entity: User,
+                         repo: Repo,
+                         after_input: {1, _}
+                       }}
+    end
+  end
+
+  describe "bulk operation opt-in" do
+    test "middleware that did not opt in is skipped for insert_all/3 (runs natively)" do
+      Repo.set_middleware([Recorder])
+      flush_messages()
+
+      now = NaiveDateTime.truncate(NaiveDateTime.utc_now(), :second)
+
+      rows = [
+        %{name: "Skip One", email: "skip_insert_1@example.com", age: 20, inserted_at: now, updated_at: now}
+      ]
+
+      {count, _} = Repo.insert_all(User, rows)
+
+      # The row is still inserted (native operation runs)...
+      assert count == 1
+      # ...but the non-opted-in middleware never saw the bulk action.
+      refute_received {:before, :insert_all, _}
+      refute_received {:after, :insert_all, _}
+    end
+
+    test "middleware that did not opt in is skipped for update_all/3 and delete_all/2" do
+      {:ok, _} = Repo.insert(%User{name: "Skip Update", email: "skip_update_1@example.com", age: 1})
+      {:ok, _} = Repo.insert(%User{name: "Skip Delete", email: "skip_delete_1@example.com"})
+
+      Repo.set_middleware([Recorder])
+      flush_messages()
+
+      update_query = from(u in User, where: u.email == "skip_update_1@example.com")
+      {1, _} = Repo.update_all(update_query, set: [age: 99])
+
+      delete_query = from(u in User, where: u.email == "skip_delete_1@example.com")
+      {1, _} = Repo.delete_all(delete_query)
+
+      refute_received {:before, :update_all, _}
+      refute_received {:before, :delete_all, _}
+    end
+
+    test "opting in is additive - bulk-aware middleware still runs on single-record operations" do
+      Repo.set_middleware([BulkRecorder])
+      flush_messages()
+
+      changeset = User.changeset(%User{}, %{name: "Additive", email: "additive@example.com"})
+      {:ok, _user} = Repo.insert(changeset)
+
+      # The bulk-opted middleware is not restricted to bulk - it runs on single-row ops too.
+      assert_received {:before, :insert, %Ecto.Changeset{}}
+      assert_received {:after, :insert, {:ok, %User{}}}
+    end
+
+    test "mixed chain - only opted-in middleware run for a bulk action" do
+      Repo.set_middleware([Recorder, BulkRecorder])
+      flush_messages()
+
+      now = NaiveDateTime.truncate(NaiveDateTime.utc_now(), :second)
+
+      rows = [
+        %{name: "Mixed One", email: "mixed_insert_1@example.com", age: 20, inserted_at: now, updated_at: now}
+      ]
+
+      {1, _} = Repo.insert_all(User, rows)
+
+      # Exactly one middleware (BulkRecorder) ran; Recorder was filtered out, so there is
+      # no second :before message from the chain.
+      assert_received {:before, :insert_all, User}
+      assert_received {:after, :insert_all, {1, _}}
+      refute_received {:before, :insert_all, _}
     end
   end
 
@@ -531,7 +684,7 @@ defmodule EctoMiddleware.RepoTest do
         use EctoMiddleware
 
         def process(resource, resolution) do
-          resolution = EctoMiddleware.Resolution.put_private(resolution, :trace_id, "abc123")
+          resolution = Resolution.put_private(resolution, :trace_id, "abc123")
           {result, _} = EctoMiddleware.Engine.yield(resource, resolution)
           result
         end
@@ -542,7 +695,7 @@ defmodule EctoMiddleware.RepoTest do
         use EctoMiddleware
 
         def process(resource, resolution) do
-          trace_id = EctoMiddleware.Resolution.get_private(resolution, :trace_id)
+          trace_id = Resolution.get_private(resolution, :trace_id)
           send(self(), {:trace_id, trace_id})
           {result, _} = EctoMiddleware.Engine.yield(resource, resolution)
           result

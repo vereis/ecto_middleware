@@ -135,6 +135,43 @@ defmodule EctoMiddleware.UtilsTest do
     end
   end
 
+  describe "guards: is_bulk_action/2" do
+    test "matches bulk actions" do
+      assert is_bulk_action(nil, :insert_all)
+      assert is_bulk_action(nil, :update_all)
+      assert is_bulk_action(nil, :delete_all)
+    end
+
+    test "does not match single-record or read actions" do
+      refute is_bulk_action(nil, :insert)
+      refute is_bulk_action(nil, :update)
+      refute is_bulk_action(nil, :delete)
+      refute is_bulk_action(nil, :insert_or_update)
+      refute is_bulk_action(nil, :get)
+      refute is_bulk_action(nil, :all)
+    end
+  end
+
+  describe "single-record guards exclude bulk actions" do
+    test "is_insert/2 does not match insert_all" do
+      refute is_insert(built_changeset(), :insert_all)
+    end
+
+    test "is_update/2 does not match update_all" do
+      refute is_update(loaded_changeset(), :update_all)
+    end
+
+    test "is_delete/2 does not match delete_all" do
+      refute is_delete(nil, :delete_all)
+    end
+
+    test "is_write/2 still matches bulk actions (bulk operations are writes)" do
+      assert is_write(nil, :insert_all)
+      assert is_write(nil, :update_all)
+      assert is_write(nil, :delete_all)
+    end
+  end
+
   describe "apply/3" do
     test "with {:ok, value}, applies function to inner value" do
       result = Utils.apply({:ok, 1}, %{}, &(&1 * 2))

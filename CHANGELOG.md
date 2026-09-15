@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0]
+
+### Added
+
+- **Bulk operation support** - `insert_all/3`, `update_all/3`, and `delete_all/2` now run
+  through the middleware pipeline. Previously they bypassed it entirely.
+- **Opt-in per middleware** - `use EctoMiddleware, bulk_operations: true` opts a middleware
+  into bulk actions. Middleware default to `false`, and non-opted middleware are filtered
+  out before middleware execution.
+- `is_bulk_action/2` guard, for opted-in middleware to branch on the differing resource
+  shape. `is_insert/2`, `is_update/2`, and `is_delete/2` remain scoped to single-record
+  operations and intentionally do not match bulk actions; `is_write/2` still matches them.
+
+### Migration
+
+The Repo's `middleware/2` callback now receives bulk operations before the opt-in filter
+runs. Callbacks that inspect the resource as a struct or changeset may need an explicit
+bulk clause before their existing clauses:
+
+```elixir
+def middleware(action, resource) when is_bulk_action(resource, action), do: []
+```
+
+Return bulk-aware middleware instead of `[]` to enable middleware for these calls.
+
+### Fixed
+
+- **Resolution updates no longer stranded by the generated `process/2`.** The default
+  `process/2` returned a bare value, discarding the resolution updated deeper in the chain.
+  Any v2 middleware not positioned outermost therefore swallowed `before_output` and
+  `after_input`, silently breaking outer middleware that read them (`ecto_hooks` dispatches
+  its `after_*` hooks off `before_output`). It now returns the `{:cont | :halt, value,
+  resolution}` 3-tuple that `yield/2` already accepted.
+- **3-tuple returns from `process_before/2` and `process_after/2` now work.** They are
+  documented as supported since 2.0.0, but `normalize/1` had no clause for them, so they
+  fell through to the bare-value clause -- wrapping the whole tuple as the value and
+  emitting a spurious bare-return deprecation warning.
+- **`EctoMiddleware.Super` survives the bulk middleware filter.** Super is not a middleware
+  but the marker `validate_middleware!/1` uses to split a v1 chain into its `:before` and
+  `:after` phases. Filtering it out under a bulk opt-in predicate left that reduce stuck in
+  `:before`, so an opted-in v1 middleware positioned after Super was handed the resource
+  instead of the operation's result.
+
 ## [2.0.0] - 2025-12-21
 
 ### Added

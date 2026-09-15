@@ -31,11 +31,12 @@ defmodule EctoMiddleware.Utils do
   ### Available Guards
 
   - `is_read/2` - Matches read operations (get, get!, all, etc.)
-  - `is_write/2` - Matches write operations (insert, update, delete, etc.)
-  - `is_insert/2` - Matches inserts (including insert_or_update with new records)
-  - `is_update/2` - Matches updates (including insert_or_update with existing records)
-  - `is_delete/2` - Matches delete operations
+  - `is_write/2` - Matches write operations (insert, update, delete, bulk, etc.)
+  - `is_insert/2` - Matches single-record inserts (including insert_or_update with new records)
+  - `is_update/2` - Matches single-record updates (including insert_or_update with existing records)
+  - `is_delete/2` - Matches single-record delete operations
   - `is_preload/2` - Matches preload operations
+  - `is_bulk_action/2` - Matches bulk operations (insert_all, update_all, delete_all)
 
   ### How `insert_or_update` Detection Works
 
@@ -43,7 +44,7 @@ defmodule EctoMiddleware.Utils do
 
       # New record (insert)
       changeset.data.__meta__.state == :built
-      
+
       # Existing record (update)
       changeset.data.__meta__.state == :loaded
 
@@ -58,7 +59,7 @@ defmodule EctoMiddleware.Utils do
           enriched = Utils.apply(result, resolution, fn user ->
             %{user | full_name: "\#{user.first_name} \#{user.last_name}"}
           end)
-          
+
           {:cont, enriched}
         end
       end
@@ -79,6 +80,7 @@ defmodule EctoMiddleware.Utils do
   @update_actions [:update, :update!]
   @delete_actions [:delete, :delete!]
   @insert_or_update_actions [:insert_or_update, :insert_or_update!]
+  @bulk_actions [:insert_all, :update_all, :delete_all]
 
   # ============================================
   # Guards
@@ -100,7 +102,8 @@ defmodule EctoMiddleware.Utils do
   Matches the action atoms for the following `Ecto.Repo` callbacks:
   `c:Ecto.Repo.insert/2`, `c:Ecto.Repo.insert!/2`, `c:Ecto.Repo.update/2`, `c:Ecto.Repo.update!/2`,
   `c:Ecto.Repo.delete/2`, `c:Ecto.Repo.delete!/2`, `c:Ecto.Repo.insert_or_update/2`,
-  `c:Ecto.Repo.insert_or_update!/2`
+  `c:Ecto.Repo.insert_or_update!/2`, `c:Ecto.Repo.insert_all/3`, `c:Ecto.Repo.update_all/3`,
+  `c:Ecto.Repo.delete_all/2`
   """
   defguard is_write(_changeset, action) when action not in @read_actions
 
@@ -141,6 +144,28 @@ defmodule EctoMiddleware.Utils do
   Matches the action atom for `c:Ecto.Repo.preload/3`.
   """
   defguard is_preload(_changeset, action) when action == :preload
+
+  @doc """
+  Guard that matches bulk (batch) actions.
+
+  Matches the action atoms for `c:Ecto.Repo.insert_all/3`, `c:Ecto.Repo.update_all/3`,
+  and `c:Ecto.Repo.delete_all/2`.
+
+  Bulk actions are **not** matched by `is_insert/2`, `is_update/2`, or `is_delete/2` — those
+  guards are scoped to single-record changeset operations. Use this guard inside a middleware
+  that opted into bulk operations (via `use EctoMiddleware, bulk_operations: true`) to branch
+  on the differing resource shape: `insert_all` receives the schema/source (first argument), while
+  `update_all`/`delete_all` receive an `Ecto.Queryable` (rows/updates are available in `resolution.args`).
+
+      def process_before(resource, %{action: action}) when is_bulk_action(resource, action) do
+        {:cont, handle_bulk(resource)}
+      end
+
+      def process_before(changeset, _resolution) do
+        {:cont, handle_single(changeset)}
+      end
+  """
+  defguard is_bulk_action(_resource, action) when action in @bulk_actions
 
   # ============================================
   # Result Transformation

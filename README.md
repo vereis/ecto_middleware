@@ -18,6 +18,7 @@ EctoMiddleware provides a clean, composable way to add cross-cutting concerns to
 - **Transform data** before it reaches the database (normalization, validation, enrichment)
 - **Transform data** after database operations (logging, notifications, caching)
 - **Replace operations** entirely (soft deletes, read-through caching, authorization)
+- **Intercept batch operations** like `insert_all/3`, `update_all/3`, and `delete_all/2` (opt-in per middleware via `use EctoMiddleware, bulk_operations: true`)
 - **Halt execution** with authorization checks or validation failures
 - **Telemetry integration** for observability
 - **Backwards compatible** with v1.x middleware

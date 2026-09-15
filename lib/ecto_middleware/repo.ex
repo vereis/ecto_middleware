@@ -43,6 +43,39 @@ defmodule EctoMiddleware.Repo do
   Available actions:
   - Read: `:get`, `:get!`, `:get_by`, `:get_by!`, `:one`, `:one!`, `:all`, `:reload`, `:reload!`, `:preload`
   - Write: `:insert`, `:insert!`, `:update`, `:update!`, `:delete`, `:delete!`, `:insert_or_update`, `:insert_or_update!`
+  - Bulk: `:insert_all`, `:update_all`, `:delete_all` (opt-in, see below)
+
+  ## Bulk Operations
+
+  `insert_all/3`, `update_all/3`, and `delete_all/2` are intercepted too, but middleware
+  must **opt in** to run on them. This avoids passing a schema/source or queryable to
+  middleware written for single-record changesets.
+
+  Opt a middleware in with the `bulk_operations: true` option:
+
+      defmodule AuditBulk do
+        use EctoMiddleware, bulk_operations: true
+
+        def process_before(resource, %{action: action}) when is_bulk_action(resource, action) do
+          {:cont, resource}
+        end
+
+        def process_before(changeset, _resolution), do: {:cont, changeset}
+      end
+
+  Middleware that do **not** opt in are dropped from the chain for bulk actions, even when
+  your `middleware/2` returns them. Before callbacks receive the first argument to the Repo
+  operation: the schema/source for `insert_all`, or an `Ecto.Queryable` for `update_all`
+  and `delete_all`. The full argument list, including rows, updates, and options, is
+  available in `resolution.args`. After callbacks receive `{count, records_or_nil}`.
+
+  The Repo's `middleware/2` callback runs **before** this filter to choose the middleware
+  list, even if no middleware have opted in. If your callback assumes write resources are
+  structs or changesets, add a bulk clause before those clauses:
+
+      def middleware(action, resource) when is_bulk_action(resource, action), do: []
+
+  Return bulk-aware middleware instead of `[]` to enable middleware for these calls.
 
   ### Pattern Matching on Resources
 
@@ -91,12 +124,14 @@ defmodule EctoMiddleware.Repo do
           :all
           | :delete!
           | :delete
+          | :delete_all
           | :get!
           | :get
           | :get_by!
           | :get_by
           | :insert!
           | :insert
+          | :insert_all
           | :insert_or_update!
           | :insert_or_update
           | :one!
@@ -106,6 +141,7 @@ defmodule EctoMiddleware.Repo do
           | :preload
           | :update!
           | :update
+          | :update_all
 
   @type resource ::
           %{__struct__: Ecto.Queryable}
@@ -143,12 +179,14 @@ defmodule EctoMiddleware.Repo do
                      all: 2,
                      delete!: 2,
                      delete: 2,
+                     delete_all: 2,
                      get!: 3,
                      get: 3,
                      get_by!: 3,
                      get_by: 3,
                      insert!: 2,
                      insert: 2,
+                     insert_all: 3,
                      insert_or_update!: 2,
                      insert_or_update: 2,
                      one!: 2,
@@ -157,11 +195,13 @@ defmodule EctoMiddleware.Repo do
                      reload: 2,
                      preload: 3,
                      update!: 2,
-                     update: 2
+                     update: 2,
+                     update_all: 3
 
       EctoMiddleware.Repo.stub_optimistic_functions!()
       EctoMiddleware.Repo.stub_ok_error_functions!()
       EctoMiddleware.Repo.stub_bang_functions!()
+      EctoMiddleware.Repo.stub_bulk_functions!()
     end
   end
 
@@ -185,7 +225,11 @@ defmodule EctoMiddleware.Repo do
         %{repo: __MODULE__, action: unquote(fun), resource: resource, pipeline_id: pipeline_id}
       )
 
-      middlewares = middleware(unquote(fun), resource)
+      middlewares =
+        unquote(fun)
+        |> middleware(resource)
+        |> EctoMiddleware.Engine.reject_non_bulk_middleware(unquote(fun))
+
       normalized = EctoMiddleware.Engine.validate_middleware!(middlewares)
 
       super_fn = fn res, _resolution ->
@@ -285,6 +329,27 @@ defmodule EctoMiddleware.Repo do
 
     arity_2 = [:insert_or_update!, :delete!, :one!, :update!, :insert!]
     arity_3 = [:get!, :get_by!]
+
+    for {fun, arity} <- Enum.map(arity_2, &{&1, 2}) ++ Enum.map(arity_3, &{&1, 3}) do
+      args_for_def = generate_arguments(arity, c)
+      body = stub_function_body(fun, arity, c)
+
+      quote location: :keep do
+        def unquote(fun)(unquote_splicing(args_for_def)) do
+          unquote(body)
+        end
+      end
+    end
+  end
+
+  @doc false
+  defmacro stub_bulk_functions! do
+    import Macro
+
+    c = __MODULE__
+
+    arity_2 = [:delete_all]
+    arity_3 = [:insert_all, :update_all]
 
     for {fun, arity} <- Enum.map(arity_2, &{&1, 2}) ++ Enum.map(arity_3, &{&1, 3}) do
       args_for_def = generate_arguments(arity, c)

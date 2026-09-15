@@ -21,6 +21,22 @@ defmodule EctoMiddlewareTest do
       assert {:cont, :resource} = DefaultBeforeTest.process_before(:resource, %EctoMiddleware.Resolution{})
     end
 
+    test "does not opt into bulk operations by default" do
+      defmodule BulkDefaultTest do
+        use EctoMiddleware
+      end
+
+      refute BulkDefaultTest.__ecto_middleware_handles_bulk__()
+    end
+
+    test "opts into bulk operations with bulk_operations: true" do
+      defmodule BulkOptInTest do
+        use EctoMiddleware, bulk_operations: true
+      end
+
+      assert BulkOptInTest.__ecto_middleware_handles_bulk__()
+    end
+
     test "provides default process_after/2 that returns {:cont, result}" do
       defmodule DefaultAfterTest do
         use EctoMiddleware
@@ -44,7 +60,7 @@ defmodule EctoMiddlewareTest do
       }
 
       result = DefaultProcessTest.process(:input, resolution)
-      assert result == :input
+      assert {:cont, :input, %EctoMiddleware.Resolution{}} = result
     end
 
     test "allows overriding process_before/2" do
@@ -118,7 +134,7 @@ defmodule EctoMiddlewareTest do
       }
 
       result = SequenceTest.process(:input, resolution)
-      assert result == {:after, {:super, :input}}
+      assert {:cont, {:after, {:super, :input}}, %EctoMiddleware.Resolution{}} = result
     end
 
     test "halts on process_before {:halt, value}" do
@@ -152,8 +168,9 @@ defmodule EctoMiddlewareTest do
         }
       }
 
+      # `process_before/2` halted, so `yield/2` never ran and there is no resolution to return
       result = HaltBeforeTest.process(:input, resolution)
-      assert result == :halted_before
+      assert result == {:halt, :halted_before}
       refute_received :should_not_run
       refute_received :super_should_not_run
     end
@@ -181,7 +198,7 @@ defmodule EctoMiddlewareTest do
       }
 
       result = HaltAfterTest.process(:input, resolution)
-      assert result == :halted_after
+      assert {:halt, :halted_after, %EctoMiddleware.Resolution{}} = result
     end
   end
 end

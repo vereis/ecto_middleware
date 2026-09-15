@@ -517,4 +517,104 @@ defmodule EctoMiddleware.EngineTest do
       refute Engine.warnings_silenced?()
     end
   end
+
+  describe "run_phases/5 - resolution propagation" do
+    test "resolution updates from an inner middleware reach an outer middleware" do
+      defmodule InnerMiddleware do
+        @moduledoc false
+        use EctoMiddleware
+      end
+
+      defmodule OuterMiddleware do
+        @moduledoc false
+        use EctoMiddleware
+
+        @impl true
+        def process_after(result, resolution) do
+          send(self(), {:outer_saw_before_output, resolution.before_output})
+          {:cont, result}
+        end
+      end
+
+      resolution = build_resolution([OuterMiddleware, InnerMiddleware])
+      {_result, _updated} = Engine.yield(:input, resolution)
+
+      # `before_output` is set by the innermost `yield/2`. It only reaches the outer
+      # middleware if the inner one's generated `process/2` hands its updated resolution
+      # back out. Returning a bare value there strands the update, which silently breaks
+      # any outer middleware reading it (`ecto_hooks` dispatches `after_*` off this field).
+      assert_received {:outer_saw_before_output, :input}
+    end
+
+    test "process_before/2 may return an updated resolution" do
+      defmodule BeforeUpdatesResolution do
+        @moduledoc false
+        use EctoMiddleware
+
+        @impl true
+        def process_before(resource, resolution) do
+          {:cont, resource, Resolution.put_private(resolution, :before_ran, true)}
+        end
+      end
+
+      resolution = build_resolution([BeforeUpdatesResolution])
+      {_result, updated} = Engine.yield(:input, resolution)
+
+      assert Resolution.get_private(updated, :before_ran) == true
+    end
+
+    test "process_after/2 may return an updated resolution" do
+      defmodule AfterUpdatesResolution do
+        @moduledoc false
+        use EctoMiddleware
+
+        @impl true
+        def process_after(result, resolution) do
+          {:cont, result, Resolution.put_private(resolution, :after_ran, true)}
+        end
+      end
+
+      resolution = build_resolution([AfterUpdatesResolution])
+      {_result, updated} = Engine.yield(:input, resolution)
+
+      assert Resolution.get_private(updated, :after_ran) == true
+    end
+  end
+
+  describe "reject_non_bulk_middleware/2" do
+    defmodule BulkOptedIn do
+      @moduledoc false
+      use EctoMiddleware, bulk_operations: true
+    end
+
+    defmodule NotBulkOptedIn do
+      @moduledoc false
+      use EctoMiddleware
+    end
+
+    test "is a pass-through for non-bulk actions" do
+      chain = [NotBulkOptedIn, EctoMiddleware.Super, BulkOptedIn]
+
+      assert Engine.reject_non_bulk_middleware(chain, :insert) == chain
+    end
+
+    test "drops middleware that did not opt into bulk operations" do
+      chain = [NotBulkOptedIn, BulkOptedIn]
+
+      assert Engine.reject_non_bulk_middleware(chain, :insert_all) == [BulkOptedIn]
+    end
+
+    test "keeps EctoMiddleware.Super for every bulk action" do
+      # Super is not a middleware but the marker `validate_middleware!/1` uses to split a
+      # v1 chain into its `:before` and `:after` phases. Dropping it here leaves that reduce
+      # stuck in `:before`, so an opted-in v1 middleware placed after Super would be handed
+      # the resource instead of the operation's result.
+      chain = [NotBulkOptedIn, EctoMiddleware.Super, BulkOptedIn]
+
+      for action <- [:insert_all, :update_all, :delete_all] do
+        assert Engine.reject_non_bulk_middleware(chain, action) ==
+                 [EctoMiddleware.Super, BulkOptedIn]
+      end
+    end
+  end
 end
