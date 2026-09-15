@@ -102,7 +102,8 @@ defmodule EctoMiddleware.Utils do
   Matches the action atoms for the following `Ecto.Repo` callbacks:
   `c:Ecto.Repo.insert/2`, `c:Ecto.Repo.insert!/2`, `c:Ecto.Repo.update/2`, `c:Ecto.Repo.update!/2`,
   `c:Ecto.Repo.delete/2`, `c:Ecto.Repo.delete!/2`, `c:Ecto.Repo.insert_or_update/2`,
-  `c:Ecto.Repo.insert_or_update!/2`
+  `c:Ecto.Repo.insert_or_update!/2`, `c:Ecto.Repo.insert_all/3`, `c:Ecto.Repo.update_all/3`,
+  `c:Ecto.Repo.delete_all/2`
   """
   defguard is_write(_changeset, action) when action not in @read_actions
 

@@ -48,7 +48,7 @@ defmodule EctoMiddleware.Repo do
   ## Bulk Operations
 
   `insert_all/3`, `update_all/3`, and `delete_all/2` are intercepted too, but middleware
-  must **opt in** to run on them. This avoids silently handing a query or a list of maps to
+  must **opt in** to run on them. This avoids passing a schema/source or queryable to
   middleware written for single-record changesets.
 
   Opt a middleware in with the `bulk_operations: true` option:
@@ -64,9 +64,18 @@ defmodule EctoMiddleware.Repo do
       end
 
   Middleware that do **not** opt in are dropped from the chain for bulk actions, even when
-  your `middleware/2` (e.g. a catch-all clause) returns them. The differing resource shapes —
-  `insert_all` receives the schema/source (first argument), while `update_all`/`delete_all` receive an `Ecto.Queryable` —
-  and the full argument list (rows/updates/options) is available in `resolution.args`.
+  your `middleware/2` returns them. Before callbacks receive the first argument to the Repo
+  operation: the schema/source for `insert_all`, or an `Ecto.Queryable` for `update_all`
+  and `delete_all`. The full argument list, including rows, updates, and options, is
+  available in `resolution.args`. After callbacks receive `{count, records_or_nil}`.
+
+  The Repo's `middleware/2` callback runs **before** this filter to choose the middleware
+  list, even if no middleware have opted in. If your callback assumes write resources are
+  structs or changesets, add a bulk clause before those clauses:
+
+      def middleware(action, resource) when is_bulk_action(resource, action), do: []
+
+  Return bulk-aware middleware instead of `[]` to enable middleware for these calls.
 
   ### Pattern Matching on Resources
 

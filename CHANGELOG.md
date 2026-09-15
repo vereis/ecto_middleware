@@ -12,12 +12,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Bulk operation support** - `insert_all/3`, `update_all/3`, and `delete_all/2` now run
   through the middleware pipeline. Previously they bypassed it entirely.
 - **Opt-in per middleware** - `use EctoMiddleware, bulk_operations: true` opts a middleware
-  into bulk actions. Middleware default to `false`, so upgrading is a no-op: a Repo's
-  `middleware/2` may keep returning its usual list (catch-all clauses included) and
-  non-opted middleware are filtered out before a bulk call executes.
+  into bulk actions. Middleware default to `false`, and non-opted middleware are filtered
+  out before middleware execution.
 - `is_bulk_action/2` guard, for opted-in middleware to branch on the differing resource
   shape. `is_insert/2`, `is_update/2`, and `is_delete/2` remain scoped to single-record
   operations and intentionally do not match bulk actions; `is_write/2` still matches them.
+
+### Migration
+
+The Repo's `middleware/2` callback now receives bulk operations before the opt-in filter
+runs. Callbacks that inspect the resource as a struct or changeset may need an explicit
+bulk clause before their existing clauses:
+
+```elixir
+def middleware(action, resource) when is_bulk_action(resource, action), do: []
+```
+
+Return bulk-aware middleware instead of `[]` to enable middleware for these calls.
 
 ### Fixed
 
